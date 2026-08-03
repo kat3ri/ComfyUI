@@ -336,7 +336,10 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
     def execute(cls, clip, vae, context_latent, prompt, length, context_frames=2, context_strength=1.0,
                 audio_vae=None, ref_image_size="match",
                 ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
-        ctx_video, _ctx_audio = context_latent["samples"].tensors
+        ctx_samples = context_latent["samples"]
+        # accept either a full AV NestedTensor (from an H3 sampler output) or a
+        # plain video-only latent (e.g. a straight VAEEncode of external footage)
+        ctx_video = ctx_samples.tensors[0] if ctx_samples.is_nested else ctx_samples
         if ctx_video.shape[0] != 1:
             raise ValueError("MiniMax H3 supports batch size 1")
         ctx_t, ctx_h, ctx_w = ctx_video.shape[2], ctx_video.shape[3], ctx_video.shape[4]
