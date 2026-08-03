@@ -20,6 +20,7 @@ import comfy.model_sampling
 import comfy.nested_tensor
 import comfy.utils
 import node_helpers
+from comfy.ldm.minimax.model import context_span
 from comfy_api.latest import ComfyExtension, io
 
 CANVAS_MULTIPLE = 32
@@ -96,6 +97,43 @@ class EmptyMiniMaxH3LatentAV(io.ComfyNode):
     def execute(cls, width, height, length) -> io.NodeOutput:
         latent, _ = _empty_av_latent(width, height, length)
         return io.NodeOutput(latent)
+
+
+class MiniMaxH3EncodeAV(io.ComfyNode):
+    """VAE-encode video frames (+ optional audio) into a MiniMax H3 AV latent.
+
+    Inverse of decoding: for recombining externally-sourced or already-decoded
+    footage into a context_latent for MiniMaxH3VideoExtend. Frames are encoded as
+    a fresh sequence (the causal VAE's front padding treats whatever you pass in
+    as the start), so prefer feeding VideoExtend a sampler's own AV latent output
+    directly when you have it -- use this node when you only have pixels/audio.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3EncodeAV",
+            display_name="MiniMax H3 Encode AV",
+            category="model/latent/minimax",
+            description="VAE-encode video frames (+ optional audio) into a MiniMax H3 AV latent (NestedTensor pair).",
+            inputs=[
+                io.Vae.Input("vae"),
+                io.Image.Input("images", tooltip="Video frames at 24 fps"),
+                io.Vae.Input("audio_vae", optional=True),
+                io.Audio.Input("audio", optional=True),
+            ],
+            outputs=[io.Latent.Output()],
+        )
+
+    @classmethod
+    def execute(cls, vae, images, audio_vae=None, audio=None) -> io.NodeOutput:
+        video_z = vae.encode(images[..., :3])
+        if audio is None:
+            return io.NodeOutput({"samples": video_z})
+        if audio_vae is None:
+            raise ValueError("audio_vae is required when audio is supplied")
+        audio_z, _ = _encode_ref_audio(audio_vae, audio)
+        return io.NodeOutput({"samples": comfy.nested_tensor.NestedTensor((video_z, audio_z))})
 
 
 class MiniMaxH3ImageToVideo(io.ComfyNode):
@@ -339,7 +377,9 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
         ctx_samples = context_latent["samples"]
         # accept either a full AV NestedTensor (from an H3 sampler output) or a
         # plain video-only latent (e.g. a straight VAEEncode of external footage)
-        ctx_video = ctx_samples.tensors[0] if ctx_samples.is_nested else ctx_samples
+        is_av = ctx_samples.is_nested
+        ctx_video = ctx_samples.tensors[0] if is_av else ctx_samples
+        ctx_audio = ctx_samples.tensors[1] if is_av else None
         if ctx_video.shape[0] != 1:
             raise ValueError("MiniMax H3 supports batch size 1")
         ctx_t, ctx_h, ctx_w = ctx_video.shape[2], ctx_video.shape[3], ctx_video.shape[4]
@@ -358,10 +398,19 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
         tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
         cond = clip.encode_from_tokens_scheduled(tokens)
 
-        context_kf = {"kind": "context", "num_frames": n_frames,
-                     "latent": ctx_video[:, :, ctx_t - n_frames:, :, :]}
-        values = {"minimax_keyframes": [context_kf], "minimax_frame_count": frame_count,
-                 "minimax_visual_cond_noise_aug": context_strength}
+        keyframes = [{"kind": "context", "num_frames": n_frames,
+                     "latent": ctx_video[:, :, ctx_t - n_frames:, :, :]}]
+        if ctx_audio is not None:
+            # match the audio context's duration to the video context's, both ending
+            # at the same target origin (see context_span)
+            ctx_audio_t = ctx_audio.shape[-1]
+            n_audio_frames = min(round(context_span(n_frames)), ctx_audio_t)
+            if n_audio_frames > 0:
+                keyframes.append({"kind": "context_audio", "num_frames": n_audio_frames,
+                                  "audio_latent": ctx_audio[:, :, :, ctx_audio_t - n_audio_frames:]})
+        values = {"minimax_keyframes": keyframes, "minimax_frame_count": frame_count,
+                 "minimax_visual_cond_noise_aug": context_strength,
+                 "minimax_audio_cond_noise_aug": context_strength}
         if ref_blocks:
             values["minimax_refs"] = ref_blocks
         cond = node_helpers.conditioning_set_values(cond, values)
@@ -415,6 +464,7 @@ class MiniMaxH3Extension(ComfyExtension):
     async def get_node_list(self):
         return [
             EmptyMiniMaxH3LatentAV,
+            MiniMaxH3EncodeAV,
             MiniMaxH3ImageToVideo,
             MiniMaxH3ReferenceToVideo,
             MiniMaxH3VideoExtend,

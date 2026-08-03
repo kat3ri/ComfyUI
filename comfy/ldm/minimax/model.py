@@ -117,6 +117,30 @@ def _video_grid(vt, frame, cursor):
     return g.reshape(-1, 3)
 
 
+def context_span(n_frames):
+    """Cursor-axis duration spanned by n_frames trailing latent frames ending at a
+    target origin, walking k = -n_frames..-1 through the FRAME_PER_TOKEN cycle."""
+    return sum(FRAME_RESCALE * FRAME_PER_TOKEN[k % 5] for k in range(-n_frames, 0))
+
+
+def _refs_cursor_delta(refs):
+    """Cumulative cursor advance the refs loop below applies, without building segments.
+
+    Needed up front so keyframe cond rows (built before refs) can anchor to the
+    target's true origin even when refs are also present and push it later.
+    """
+    delta = 0.0
+    for blk in refs:
+        kind = blk["kind"]
+        if kind == "image":
+            delta += 1.0
+        elif kind == "audio":
+            delta += float(blk["ref_audio_t"])
+        elif kind in ("video", "video_audio"):
+            delta += max(float(blk["ref_audio_t"]), sum(_video_t_spans(blk["latent_t"])))
+    return delta
+
+
 class TimeEmbedder(nn.Module):
     def __init__(self, freq_dim, hidden, out, dtype=None, device=None, operations=None):
         super().__init__()
@@ -311,6 +335,12 @@ class PackedLayout:
         cursor = text_len
         row = text_len
 
+        target_audio_w = (float(w_grid[0]), float(w_grid[-1]))
+        # refs (built below) push the target's own origin later along the cursor axis;
+        # keyframe cond rows are built first (fixed row order) but must still anchor to
+        # that eventual origin, so its delta is precomputed here.
+        target_origin = float(text_len) + (_refs_cursor_delta(refs) if refs else 0.0)
+
         if keyframes:
             # fl2va: keyframe cond rows right after text, sharing the target spatial grid
             for kf in keyframes:
@@ -323,7 +353,7 @@ class PackedLayout:
                     n_frames = kf["num_frames"]
                     spans = torch.tensor([FRAME_RESCALE * FRAME_PER_TOKEN[k % 5] for k in range(-n_frames, 0)],
                                          dtype=torch.float64)
-                    t_grid = (float(text_len) - float(spans.sum())
+                    t_grid = (target_origin - context_span(n_frames)
                              + torch.cat([torch.zeros(1, dtype=torch.float64), spans.cumsum(0)[:-1]]))
                     g = torch.empty(n_frames, frame_rows, 3, dtype=torch.float64)
                     g[:, :, 0] = t_grid[:, None]
@@ -335,11 +365,22 @@ class PackedLayout:
                     img_update.append(torch.zeros(n, dtype=torch.bool))
                     row += n
                     continue
+                if kf.get("kind") == "context_audio":
+                    # audio counterpart of the video-extend context block above: rt trailing
+                    # audio-latent steps (uniform duration, unlike video's weighted cycle)
+                    # ending immediately before the target's own audio.
+                    rt = kf["num_frames"]
+                    segments.append(("ref_audio", rt * 2))
+                    pos.append(_audio_grid(target_origin - rt, rt, *target_audio_w))
+                    audio_pos.append(torch.arange(row, row + rt * 2))
+                    audio_update.append(torch.zeros(rt * 2, dtype=torch.bool))
+                    row += rt * 2
+                    continue
                 pixel_index = kf["resolved_frame_index"]
                 if pixel_index == 0:
-                    cond_t = float(text_len)
+                    cond_t = target_origin
                 elif frame_count is not None and pixel_index == frame_count - 1:
-                    cond_t = float(text_len) + sum(_video_t_spans(latent_t)) - FRAME_RESCALE
+                    cond_t = target_origin + sum(_video_t_spans(latent_t)) - FRAME_RESCALE
                 else:
                     raise ValueError("only first/last keyframe anchors are supported")
                 g = torch.empty(frame_rows, 3, dtype=torch.float64)
@@ -351,7 +392,6 @@ class PackedLayout:
                 img_update.append(torch.zeros(frame_rows, dtype=torch.bool))
                 row += frame_rows
 
-        target_audio_w = (float(w_grid[0]), float(w_grid[-1]))
         if refs:
             cursor = float(text_len)
             for blk in refs:
