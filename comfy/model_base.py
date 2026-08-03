@@ -2095,7 +2095,8 @@ class MiniMaxH3(BaseModel):
         refs = kwargs.get("minimax_refs", None)
         if refs is not None:
             payload["refs"] = refs
-            payload["cond_video_latents"] = [r["latent"] for r in refs if "latent" in r]
+            # keyframes' cond rows (if any) come first in the packed layout; append refs after them
+            payload["cond_video_latents"] = payload.get("cond_video_latents", []) + [r["latent"] for r in refs if "latent" in r]
             payload["cond_audio_latents"] = [r["audio_latent"] for r in refs if r.get("audio_latent") is not None]
         if kwargs.get("minimax_visual_cond_noise_aug", None) is not None:
             payload["visual_cond_noise_aug"] = kwargs["minimax_visual_cond_noise_aug"]

@@ -314,6 +314,27 @@ class PackedLayout:
         if keyframes:
             # fl2va: keyframe cond rows right after text, sharing the target spatial grid
             for kf in keyframes:
+                if kf.get("kind") == "context":
+                    # video-extend: n_frames trailing latent frames of a prior clip, placed
+                    # at negative time immediately before this call's own frame 0. Walking
+                    # k = -n..-1 through the same FRAME_PER_TOKEN cycle the target frames use
+                    # (k = 0..latent_t-1) keeps the duration-weight phase continuous across
+                    # the boundary, as if this were one uninterrupted causal-VAE sequence.
+                    n_frames = kf["num_frames"]
+                    spans = torch.tensor([FRAME_RESCALE * FRAME_PER_TOKEN[k % 5] for k in range(-n_frames, 0)],
+                                         dtype=torch.float64)
+                    t_grid = (float(text_len) - float(spans.sum())
+                             + torch.cat([torch.zeros(1, dtype=torch.float64), spans.cumsum(0)[:-1]]))
+                    g = torch.empty(n_frames, frame_rows, 3, dtype=torch.float64)
+                    g[:, :, 0] = t_grid[:, None]
+                    g[:, :, 1:] = frame[None]
+                    n = n_frames * frame_rows
+                    segments.append(("cond", n))
+                    pos.append(g.reshape(-1, 3))
+                    img_pos.append(torch.arange(row, row + n))
+                    img_update.append(torch.zeros(n, dtype=torch.bool))
+                    row += n
+                    continue
                 pixel_index = kf["resolved_frame_index"]
                 if pixel_index == 0:
                     cond_t = float(text_len)
