@@ -2097,6 +2097,9 @@ class MiniMaxH3(BaseModel):
             kf_audio = [kf["audio_latent"] for kf in keyframes if "audio_latent" in kf]
             if kf_audio:
                 payload["cond_audio_latents"] = kf_audio
+            logging.info("[MiniMaxH3 debug] keyframes kinds=%s frame_count=%s cond_video_latents=%d cond_audio_latents=%d",
+                        [kf.get("kind", "endpoint") for kf in keyframes], payload.get("frame_count"),
+                        len(payload["cond_video_latents"]), len(payload.get("cond_audio_latents", [])))
         refs = kwargs.get("minimax_refs", None)
         if refs is not None:
             payload["refs"] = refs
