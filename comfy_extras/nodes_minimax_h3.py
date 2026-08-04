@@ -136,8 +136,38 @@ class MiniMaxH3EncodeAV(io.ComfyNode):
         return io.NodeOutput({"samples": comfy.nested_tensor.NestedTensor((video_z, audio_z))})
 
 
+def _context_keyframes(context_latent, context_frames):
+    """Build context/context_audio keyframe dicts continuing a prior generation's AV
+    latent, plus the (width, height) it implies. Shared by MiniMaxH3ImageToVideo and
+    MiniMaxH3VideoExtend."""
+    ctx_samples = context_latent["samples"]
+    # accept either a full AV NestedTensor (from an H3 sampler output) or a
+    # plain video-only latent (e.g. a straight VAEEncode of external footage)
+    is_av = ctx_samples.is_nested
+    ctx_video = ctx_samples.tensors[0] if is_av else ctx_samples
+    ctx_audio = ctx_samples.tensors[1] if is_av else None
+    if ctx_video.shape[0] != 1:
+        raise ValueError("MiniMax H3 supports batch size 1")
+    ctx_t, ctx_h, ctx_w = ctx_video.shape[2], ctx_video.shape[3], ctx_video.shape[4]
+    n_frames = min(context_frames, ctx_t)
+    width, height = ctx_w * 16, ctx_h * 16  # inherit the source clip's canvas exactly
+
+    keyframes = [{"kind": "context", "num_frames": n_frames,
+                 "latent": ctx_video[:, :, ctx_t - n_frames:, :, :]}]
+    if ctx_audio is not None:
+        # match the audio context's duration to the video context's, both ending
+        # at the same target origin (see context_span)
+        ctx_audio_t = ctx_audio.shape[-1]
+        n_audio_frames = min(round(context_span(n_frames)), ctx_audio_t)
+        if n_audio_frames > 0:
+            keyframes.append({"kind": "context_audio", "num_frames": n_audio_frames,
+                              "audio_latent": ctx_audio[:, :, :, ctx_audio_t - n_audio_frames:]})
+    return width, height, keyframes
+
+
 class MiniMaxH3ImageToVideo(io.ComfyNode):
-    """t2va and fl2va: prompt (+ optional first/last keyframes) -> conditioning + AV latent."""
+    """t2va and fl2va: prompt (+ optional first/last keyframes, + optional prior-clip
+    context) -> conditioning + AV latent."""
 
     @classmethod
     def define_schema(cls):
@@ -149,22 +179,29 @@ class MiniMaxH3ImageToVideo(io.ComfyNode):
                 io.Clip.Input("clip"),
                 io.Vae.Input("vae"),
                 io.String.Input("prompt", multiline=True, dynamic_prompts=True),
-                io.Int.Input("width", default=1344, min=32, max=nodes.MAX_RESOLUTION, step=32),
-                io.Int.Input("height", default=768, min=32, max=nodes.MAX_RESOLUTION, step=32),
-                io.Int.Input("length", default=124, min=5, max=3600, step=17, tooltip="Frame count at 24 fps, snapped up to the model's 17k+5 grid (124 = ~5s; trained range is ~124-362, longer is untested)"),
-                io.Image.Input("first_frame", optional=True),
-                io.Image.Input("last_frame", optional=True),
+                io.Int.Input("width", default=1344, min=32, max=nodes.MAX_RESOLUTION, step=32, tooltip="Ignored when context_latent is connected -- width/height are inherited from it instead"),
+                io.Int.Input("height", default=768, min=32, max=nodes.MAX_RESOLUTION, step=32, tooltip="Ignored when context_latent is connected -- width/height are inherited from it instead"),
+                io.Int.Input("length", default=124, min=5, max=3600, step=17, tooltip="Frame count at 24 fps, snapped up to the model's 17k+5 grid (124 = ~5s; trained range is ~124-362, longer is untested). Continuation-only length when context_latent is connected."),
+                io.Image.Input("first_frame", optional=True, tooltip="Pins this call's own frame 0. Redundant/conflicting if context_latent is also connected -- context already determines what follows the prior clip."),
+                io.Image.Input("last_frame", optional=True, tooltip="Pins this call's own last frame -- composes well with context_latent to land a continuation on a specific target image."),
+                io.Latent.Input("context_latent", optional=True, tooltip="Continue from a prior MiniMax H3 generation's trailing latent frames (video extension)"),
+                io.Int.Input("context_frames", default=2, min=1, max=8, tooltip="Only used when context_latent is connected: trailing latent frames of context_latent carried over as context"),
+                io.Float.Input("context_strength", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Only used when context_latent is connected: 1.0 = context frames stay clean/hard-pinned; lower blends in noise for a softer handoff"),
             ],
             outputs=[io.Conditioning.Output(display_name="positive"), io.Latent.Output()],
         )
 
     @classmethod
     def execute(cls, clip, vae, prompt, width, height, length,
-                first_frame=None, last_frame=None) -> io.NodeOutput:
+                first_frame=None, last_frame=None,
+                context_latent=None, context_frames=2, context_strength=1.0) -> io.NodeOutput:
+        keyframes = []
+        if context_latent is not None:
+            width, height, keyframes = _context_keyframes(context_latent, context_frames)
+
         latent, frame_count = _empty_av_latent(width, height, length)
 
         images = []
-        keyframes = []
         if first_frame is not None:
             # geometry anchor: plain stretch to canvas
             img = _resize(first_frame[:1], width, height, "disabled")
@@ -181,11 +218,13 @@ class MiniMaxH3ImageToVideo(io.ComfyNode):
 
         if keyframes:
             for kf in keyframes:
-                kf["latent"] = vae.encode(kf.pop("image"))
-            cond = node_helpers.conditioning_set_values(cond, {
-                "minimax_keyframes": keyframes,
-                "minimax_frame_count": frame_count,
-            })
+                if "image" in kf:
+                    kf["latent"] = vae.encode(kf.pop("image"))
+            values = {"minimax_keyframes": keyframes, "minimax_frame_count": frame_count}
+            if context_latent is not None:
+                values["minimax_visual_cond_noise_aug"] = context_strength
+                values["minimax_audio_cond_noise_aug"] = context_strength
+            cond = node_helpers.conditioning_set_values(cond, values)
         return io.NodeOutput(cond, latent)
 
 
@@ -374,18 +413,7 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
     def execute(cls, clip, vae, context_latent, prompt, length, context_frames=2, context_strength=1.0,
                 audio_vae=None, ref_image_size="match",
                 ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
-        ctx_samples = context_latent["samples"]
-        # accept either a full AV NestedTensor (from an H3 sampler output) or a
-        # plain video-only latent (e.g. a straight VAEEncode of external footage)
-        is_av = ctx_samples.is_nested
-        ctx_video = ctx_samples.tensors[0] if is_av else ctx_samples
-        ctx_audio = ctx_samples.tensors[1] if is_av else None
-        if ctx_video.shape[0] != 1:
-            raise ValueError("MiniMax H3 supports batch size 1")
-        ctx_t, ctx_h, ctx_w = ctx_video.shape[2], ctx_video.shape[3], ctx_video.shape[4]
-        n_frames = min(context_frames, ctx_t)
-        width, height = ctx_w * 16, ctx_h * 16  # inherit the source clip's canvas exactly
-
+        width, height, keyframes = _context_keyframes(context_latent, context_frames)
         latent, frame_count = _empty_av_latent(width, height, length)
 
         ref_items, ref_blocks = ([], [])
@@ -398,16 +426,6 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
         tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
         cond = clip.encode_from_tokens_scheduled(tokens)
 
-        keyframes = [{"kind": "context", "num_frames": n_frames,
-                     "latent": ctx_video[:, :, ctx_t - n_frames:, :, :]}]
-        if ctx_audio is not None:
-            # match the audio context's duration to the video context's, both ending
-            # at the same target origin (see context_span)
-            ctx_audio_t = ctx_audio.shape[-1]
-            n_audio_frames = min(round(context_span(n_frames)), ctx_audio_t)
-            if n_audio_frames > 0:
-                keyframes.append({"kind": "context_audio", "num_frames": n_audio_frames,
-                                  "audio_latent": ctx_audio[:, :, :, ctx_audio_t - n_audio_frames:]})
         values = {"minimax_keyframes": keyframes, "minimax_frame_count": frame_count,
                  "minimax_visual_cond_noise_aug": context_strength,
                  "minimax_audio_cond_noise_aug": context_strength}
