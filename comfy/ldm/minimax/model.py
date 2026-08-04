@@ -345,16 +345,17 @@ class PackedLayout:
             # fl2va: keyframe cond rows right after text, sharing the target spatial grid
             for kf in keyframes:
                 if kf.get("kind") == "context":
-                    # video-extend: n_frames trailing latent frames of a prior clip, placed
-                    # at negative time immediately before this call's own frame 0. Walking
-                    # k = -n..-1 through the same FRAME_PER_TOKEN cycle the target frames use
-                    # (k = 0..latent_t-1) keeps the duration-weight phase continuous across
-                    # the boundary, as if this were one uninterrupted causal-VAE sequence.
+                    # video-extend: n_frames trailing latent frames of a prior clip. The
+                    # LAST context frame is anchored at target_origin itself -- zero RoPE
+                    # distance from this call's own frame 0, the same trick that makes
+                    # first-frame keyframes lock identity so reliably -- rather than a full
+                    # frame-duration before it. Earlier context frames step back from there
+                    # using their own natural FRAME_PER_TOKEN spacing.
                     n_frames = kf["num_frames"]
-                    spans = torch.tensor([FRAME_RESCALE * FRAME_PER_TOKEN[k % 5] for k in range(-n_frames, 0)],
-                                         dtype=torch.float64)
-                    t_grid = (target_origin - context_span(n_frames)
-                             + torch.cat([torch.zeros(1, dtype=torch.float64), spans.cumsum(0)[:-1]]))
+                    gaps = torch.tensor([FRAME_RESCALE * FRAME_PER_TOKEN[k % 5] for k in range(-(n_frames - 1), 0)]
+                                        + [0.0], dtype=torch.float64)
+                    dist_from_last = gaps.flip(0).cumsum(0).flip(0)
+                    t_grid = target_origin - dist_from_last
                     g = torch.empty(n_frames, frame_rows, 3, dtype=torch.float64)
                     g[:, :, 0] = t_grid[:, None]
                     g[:, :, 1:] = frame[None]
