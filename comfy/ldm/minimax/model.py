@@ -134,7 +134,7 @@ def _refs_cursor_delta(refs):
     for blk in refs:
         kind = blk["kind"]
         if kind == "image":
-            delta += 1.0
+            delta += blk.get("spacing", 1.0)
         elif kind == "audio":
             delta += float(blk["ref_audio_t"])
         elif kind in ("video", "video_audio"):
@@ -412,7 +412,9 @@ class PackedLayout:
                     img_pos.append(torch.arange(row, row + n))
                     img_update.append(torch.zeros(n, dtype=torch.bool))
                     row += n
-                    cursor += 1.0
+                    # RoPE-distance separation from target_origin; larger reads to the
+                    # model as more "distant reference" vs "recent/competing" content
+                    cursor += blk.get("spacing", 1.0)
                 elif kind == "audio":
                     rt = blk["ref_audio_t"]
                     if rt > 0:
