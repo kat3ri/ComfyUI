@@ -24,6 +24,7 @@ import comfy.model_prefetch
 import comfy.ops
 import comfy.patcher_extension
 import comfy.quant_ops
+import comfy_kitchen.backends.eager.rope as _eager_rope
 from comfy.ldm.modules.attention import optimized_attention
 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
@@ -189,7 +190,14 @@ class Attention(nn.Module):
             kw = comfy.model_management.cast_to(self.k_norm.weight, device=x.device)
             rot = rope_freqs.shape[-3] * 2
             if comfy.model_management.in_training:
-                q, k = comfy.quant_ops.ck.rms_rope_split_half(
+                # comfy.quant_ops.ck.rms_rope_split_half is a torch.library.custom_op
+                # with no registered backward ("no autograd formula was registered")
+                # -- comfy_kitchen's non-in-place op exists to dodge the in-place
+                # kernel's autograd ban, but never actually got a backward wired up.
+                # Its eager Python reference impl is plain differentiable torch ops
+                # (rms_norm/cat/mul/add, no custom_op wrapper), so call that directly
+                # instead of going through the custom-op front door.
+                q, k = _eager_rope.rms_rope_split_half(
                     q, k, rope_freqs, qw, kw, epsilon=self.q_norm.eps, rot_dim=rot)
             else:
                 comfy.quant_ops.ck.rms_rope_split_half_(
