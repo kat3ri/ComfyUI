@@ -366,6 +366,21 @@ class PackedLayout:
                     img_update.append(torch.zeros(n, dtype=torch.bool))
                     row += n
                     continue
+                if kf.get("kind") == "scene":
+                    # 3D-scene adapter: n_tok pooled tokens already in hidden_size
+                    # (produced externally by GaussianSceneEncoder, not a VAE latent),
+                    # so they bypass video_patch_proj/img_update entirely and get
+                    # injected directly in _forward, same as text_states. No
+                    # meaningful per-token spatial extent (holistic scene summary,
+                    # not tied to any one frame's pixel grid) -- h=w=0, anchored at
+                    # target_origin like the video-extend context block.
+                    n_tok = kf["num_tokens"]
+                    g = torch.zeros(n_tok, 3, dtype=torch.float64)
+                    g[:, 0] = target_origin
+                    segments.append(("scene", n_tok, kf.get("aug")))
+                    pos.append(g)
+                    row += n_tok
+                    continue
                 if kf.get("kind") == "context_audio":
                     # audio counterpart of the video-extend context block above: rt trailing
                     # audio-latent steps (uniform duration, unlike video's weighted cycle)
@@ -618,7 +633,7 @@ class MiniMaxH3Model(nn.Module):
         # falls back to the kind's builtin default), so its effective timestep is per
         # segment instance, not shared across the whole kind.
         def _eff_t(kind, aug):
-            if kind in ("cond", "ref_img"):
+            if kind in ("cond", "ref_img", "scene"):
                 return max(t_v, float(aug) if aug is not None else VISUAL_COND_TIMESTEP)
             if kind == "ref_audio":
                 return max(t_a, float(aug) if aug is not None else AUDIO_COND_TIMESTEP)
@@ -627,7 +642,10 @@ class MiniMaxH3Model(nn.Module):
         seg_eff_t = [_eff_t(kind, aug) for _, _, kind, aug in layout.segments]
         unique_t = sorted(set(seg_eff_t))
         t_row = {t: i for i, t in enumerate(unique_t)}
-        seg_tag = {"text": 1, "video": 0, "audio": 2, "cond": 0, "ref_img": 0, "ref_audio": 2}
+        # "scene" shares the visual (0) adaln class -- pooled 3D-scene tokens are
+        # conceptually the same "clean visual condition" role as cond/ref_img,
+        # just pre-projected externally instead of coming from the video VAE.
+        seg_tag = {"text": 1, "video": 0, "audio": 2, "cond": 0, "ref_img": 0, "ref_audio": 2, "scene": 0}
 
         text_tags = payload.get("text_token_tags")
         mod_segments = []
@@ -672,11 +690,17 @@ class MiniMaxH3Model(nn.Module):
 
         # segments are contiguous: assemble by slices, embed rows follow segment order
         h = torch.empty(layout.seq_len, self.hidden_size, dtype=dtype, device=device)
-        voff = aoff = 0
+        scene_embedding = payload.get("scene_embedding")
+        voff = aoff = soff = 0
         for a, b, kind, _aug in layout.segments:
             n = b - a
             if kind == "text":
                 h[a:b] = text_states
+            elif kind == "scene":
+                # already hidden_size (projected externally by the adapter) --
+                # bypass video_patch_proj entirely, direct copy like text_states
+                h[a:b] = scene_embedding[soff:soff + n].to(device=device, dtype=dtype)
+                soff += n
             elif kind in ("cond", "ref_img", "video"):
                 h[a:b] = video_embed[voff:voff + n]
                 voff += n
