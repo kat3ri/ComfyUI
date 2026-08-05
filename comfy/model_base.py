@@ -2097,17 +2097,12 @@ class MiniMaxH3(BaseModel):
             kf_audio = [kf["audio_latent"] for kf in keyframes if "audio_latent" in kf]
             if kf_audio:
                 payload["cond_audio_latents"] = kf_audio
-            logging.info("[MiniMaxH3 debug] keyframes kinds=%s frame_count=%s cond_video_latents=%d cond_audio_latents=%d",
-                        [kf.get("kind", "endpoint") for kf in keyframes], payload.get("frame_count"),
-                        len(payload["cond_video_latents"]), len(payload.get("cond_audio_latents", [])))
         refs = kwargs.get("minimax_refs", None)
         if refs is not None:
             payload["refs"] = refs
             # keyframes' cond rows (if any) come first in the packed layout; append refs after them
             payload["cond_video_latents"] = payload.get("cond_video_latents", []) + [r["latent"] for r in refs if "latent" in r]
             payload["cond_audio_latents"] = payload.get("cond_audio_latents", []) + [r["audio_latent"] for r in refs if r.get("audio_latent") is not None]
-            logging.info("[MiniMaxH3 debug] refs kinds=%s total cond_video_latents=%d cond_audio_latents=%d",
-                        [r.get("kind") for r in refs], len(payload["cond_video_latents"]), len(payload.get("cond_audio_latents", [])))
         if kwargs.get("minimax_visual_cond_noise_aug", None) is not None:
             payload["visual_cond_noise_aug"] = kwargs["minimax_visual_cond_noise_aug"]
         if kwargs.get("minimax_audio_cond_noise_aug", None) is not None:

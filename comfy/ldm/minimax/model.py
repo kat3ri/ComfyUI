@@ -13,7 +13,6 @@ video sigma in closed form. The audio velocity is returned scaled by the
 schedule map's derivative d(sigma_a)/d(sigma_v).
 """
 
-import logging
 import math
 
 import torch
@@ -341,9 +340,6 @@ class PackedLayout:
         # keyframe cond rows are built first (fixed row order) but must still anchor to
         # that eventual origin, so its delta is precomputed here.
         target_origin = float(text_len) + (_refs_cursor_delta(refs) if refs else 0.0)
-        if keyframes and any(kf.get("kind") in ("context", "context_audio") for kf in keyframes):
-            logging.info("[MiniMaxH3 debug] PackedLayout text_len=%d refs_delta=%.3f target_origin=%.3f n_refs=%d",
-                        text_len, target_origin - float(text_len), target_origin, len(refs) if refs else 0)
 
         if keyframes:
             # fl2va: keyframe cond rows right after text, sharing the target spatial grid
