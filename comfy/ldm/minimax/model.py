@@ -393,6 +393,11 @@ class PackedLayout:
                 img_update.append(torch.zeros(frame_rows, dtype=torch.bool))
                 row += frame_rows
 
+        # refs form one contiguous row range (this loop runs entirely after keyframes,
+        # which is where context_audio's rows -- confusingly also tagged "ref_audio" for
+        # adaln purposes -- already landed); marking by row range instead of kind string
+        # keeps context out of ref_row_mask below.
+        refs_row_start = row
         if refs:
             cursor = float(text_len)
             for blk in refs:
@@ -439,6 +444,7 @@ class PackedLayout:
                     img_update.append(torch.zeros(n, dtype=torch.bool))
                     row += n
                     cursor += max(float(rt), sum(_video_t_spans(vt)))
+        refs_row_end = row
 
         # target audio then target video, always the last two segments
         segments.append(("audio", audio_t * 2, None))
@@ -477,11 +483,12 @@ class PackedLayout:
 
         # rows belonging to actual refs (not context, whose zero-distance anchor is
         # meant to stay strong) -- used to build a distance-decay attention bias so
-        # refs can stay close/available for identity without dominating every frame
+        # refs can stay close/available for identity without dominating every frame.
+        # By row range, not kind string: context_audio also carries the "ref_audio"
+        # kind tag (shares adaln treatment), but its rows precede refs_row_start.
         ref_row_mask = torch.zeros(row, dtype=torch.bool)
-        for a, b, kind, _ in seg_abs:
-            if kind in ("ref_img", "ref_audio"):
-                ref_row_mask[a:b] = True
+        if refs:
+            ref_row_mask[refs_row_start:refs_row_end] = True
         self.ref_row_mask = ref_row_mask
 
 
