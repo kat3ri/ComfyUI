@@ -9,6 +9,7 @@ sampling runs on the flat pack with any stock sampler (the model handles the
 audio stream's shifted schedule internally).
 """
 
+import logging
 import math
 
 import torch
@@ -448,6 +449,82 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
         return io.NodeOutput(cond, latent)
 
 
+_SCENE_ADAPTER_REPO = "/weka/home-kateriw/h3-3d-adapter"
+
+
+class MiniMaxH3SceneFromPLY(io.ComfyNode):
+    """Research prototype (untrained by default): encode a raw gaussian-splat
+    .ply directly -- no rendering step -- into H3 scene tokens, via the
+    GaussianSceneEncoder adapter (Perceiver-style: per-splat MLP + cross-
+    attention pooling + self-attention refine + linear-to-hidden_size),
+    developed in h3-3d-adapter. Appends a "scene" keyframe to whatever
+    conditioning it's given, composing with ImageToVideo/VideoExtend/
+    ReferenceToVideo's own keyframes/refs rather than replacing them.
+
+    Without adapter_checkpoint this is plumbing-only: a randomly initialized
+    adapter cannot meaningfully steer generation, it only proves the tokens
+    flow through the real model without shape/dtype errors.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3SceneFromPLY",
+            display_name="MiniMax H3 Scene From PLY (experimental adapter)",
+            category="model/conditioning/minimax",
+            description="Encode a gaussian-splat .ply into H3 scene tokens (3D-scene adapter prototype, untrained unless adapter_checkpoint is set).",
+            inputs=[
+                io.Conditioning.Input("conditioning"),
+                io.String.Input("ply_path", tooltip="Path to a 3DGS .ply (needs x,y,z,f_dc_0-2,opacity,scale_0-2,rot_0-3 vertex fields)"),
+                io.Int.Input("n_tokens", default=48, min=8, max=256, tooltip="Must match adapter_checkpoint's own n_tokens if one is given"),
+                io.Int.Input("subsample", default=200000, min=1000, max=2000000, tooltip="Random subsample of gaussians (CPU/memory tradeoff); scenes run in the hundreds of thousands of splats"),
+                io.String.Input("adapter_checkpoint", default="", optional=True, tooltip="Path to a trained GaussianSceneEncoder state_dict; empty = random-init (plumbing test only, no real conditioning effect)"),
+                io.Float.Input("scene_strength", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Noise-blend strength for the scene tokens, same convention as context_strength/ref_strength"),
+            ],
+            outputs=[io.Conditioning.Output()],
+        )
+
+    @classmethod
+    def execute(cls, conditioning, ply_path, n_tokens=48, subsample=200000,
+                adapter_checkpoint="", scene_strength=1.0) -> io.NodeOutput:
+        import sys
+        if _SCENE_ADAPTER_REPO not in sys.path:
+            sys.path.insert(0, _SCENE_ADAPTER_REPO)
+        import numpy as np
+        from plyfile import PlyData
+        from encoder.gaussian_encoder import GaussianSceneEncoder
+
+        ply = PlyData.read(ply_path)
+        v = ply["vertex"].data
+        n = len(v)
+        idx = np.random.choice(n, size=min(subsample, n), replace=False) if 0 < subsample < n else np.arange(n)
+
+        def field(name):
+            return torch.from_numpy(np.ascontiguousarray(v[name][idx]).astype(np.float32))
+
+        xyz = torch.stack([field("x"), field("y"), field("z")], dim=1)
+        f_dc = torch.stack([field("f_dc_0"), field("f_dc_1"), field("f_dc_2")], dim=1)
+        opacity = field("opacity").unsqueeze(1)
+        scale = torch.stack([field("scale_0"), field("scale_1"), field("scale_2")], dim=1)
+        rot = torch.stack([field("rot_0"), field("rot_1"), field("rot_2"), field("rot_3")], dim=1)
+
+        device = comfy.model_management.get_torch_device()
+        encoder = GaussianSceneEncoder(n_tokens=n_tokens)
+        if adapter_checkpoint:
+            encoder.load_state_dict(torch.load(adapter_checkpoint, map_location="cpu"))
+        else:
+            logging.warning("MiniMaxH3SceneFromPLY: no adapter_checkpoint given -- scene tokens are random-init, plumbing test only")
+        encoder.to(device).eval()
+        with torch.no_grad():
+            embedding = encoder(xyz.to(device), f_dc.to(device), opacity.to(device), scale.to(device), rot.to(device))
+
+        scene_kf = {"kind": "scene", "num_tokens": n_tokens,
+                   "hidden_embedding": embedding.to(comfy.model_management.intermediate_device()),
+                   "aug": scene_strength}
+        cond = node_helpers.conditioning_set_values(conditioning, {"minimax_keyframes": [scene_kf]}, append=True)
+        return io.NodeOutput(cond)
+
+
 class MiniMaxH3SigmaShift(io.ComfyNode):
     """Set the video/audio flow shifts coherently.
 
@@ -499,6 +576,7 @@ class MiniMaxH3Extension(ComfyExtension):
             MiniMaxH3ImageToVideo,
             MiniMaxH3ReferenceToVideo,
             MiniMaxH3VideoExtend,
+            MiniMaxH3SceneFromPLY,
             MiniMaxH3SigmaShift
             ]
 
