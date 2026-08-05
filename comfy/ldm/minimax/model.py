@@ -235,13 +235,29 @@ class AdalnProj(nn.Module):
 
 def _mod_scale_shift(h, shift, scale, segments):
     # segments: [(start, stop, mod_row)] covering h contiguously.
+    # In-place mul_/add_ is an inference-only optimization: it saves an
+    # allocation per block, but corrupts autograd (h's version counter keeps
+    # advancing after earlier reads of h were saved for backward, e.g. by
+    # this same call's own norm before it, or by the previous block).
+    if comfy.model_management.in_training:
+        out = torch.empty_like(h)
+        for a, b, row in segments:
+            out[a:b] = h[a:b] * (1.0 + scale[row].to(h.dtype)) + shift[row].to(h.dtype)
+        return out
     for a, b, row in segments:
         h[a:b].mul_(1.0 + scale[row].to(h.dtype)).add_(shift[row].to(h.dtype))
     return h
 
 
 def _mod_gate(x, gate, other, segments):
-    # other is the fresh attn/mlp output: accumulate the gated residual into the stream in place, one fused kernel per segment
+    # other is the fresh attn/mlp output: accumulate the gated residual into the stream,
+    # in place at inference (one fused kernel per segment); out of place in training,
+    # for the same reason as _mod_scale_shift above.
+    if comfy.model_management.in_training:
+        out = torch.empty_like(x)
+        for a, b, row in segments:
+            out[a:b] = x[a:b] + other[a:b] * gate[row].to(x.dtype)
+        return out
     for a, b, row in segments:
         x[a:b].addcmul_(other[a:b], gate[row].to(x.dtype))
     return x
