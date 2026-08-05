@@ -454,16 +454,22 @@ _SCENE_ADAPTER_REPO = "/weka/home-kateriw/h3-3d-adapter"
 
 class MiniMaxH3SceneFromPLY(io.ComfyNode):
     """Research prototype (untrained by default): encode a raw gaussian-splat
-    .ply directly -- no rendering step -- into H3 scene tokens, via the
-    GaussianSceneEncoder adapter (Perceiver-style: per-splat MLP + cross-
-    attention pooling + self-attention refine + linear-to-hidden_size),
-    developed in h3-3d-adapter. Appends a "scene" keyframe to whatever
-    conditioning it's given, composing with ImageToVideo/VideoExtend/
-    ReferenceToVideo's own keyframes/refs rather than replacing them.
+    .ply directly -- no rendering step -- into a spatial latent grid shaped
+    like a real VAE keyframe latent, via the GaussianSceneEncoder adapter
+    (per-splat MLP featurizer + distance-biased cross-attention pooling into a
+    h_lat x w_lat grid + self-attention refine + linear-to-24-channels,
+    developed in h3-3d-adapter). Because the output is shaped like a real
+    keyframe latent, it rides through H3's *existing* "ref_img" pathway --
+    real frame_grid RoPE placement, video_patch_proj, ref_spacing/ref_strength
+    -- as a synthetic reference image, skipping only the vae.encode() step
+    since we already have the latent. Appends to whatever refs the upstream
+    ReferenceToVideo/VideoExtend node already set, rather than replacing them.
 
     Without adapter_checkpoint this is plumbing-only: a randomly initialized
-    adapter cannot meaningfully steer generation, it only proves the tokens
-    flow through the real model without shape/dtype errors.
+    adapter cannot meaningfully steer generation, it only proves the latent
+    flows through the real model without shape/dtype errors (the spatial
+    structure from the distance bias exists even untrained, but what content
+    gets encoded there is what training teaches).
     """
 
     @classmethod
@@ -472,21 +478,23 @@ class MiniMaxH3SceneFromPLY(io.ComfyNode):
             node_id="MiniMaxH3SceneFromPLY",
             display_name="MiniMax H3 Scene From PLY (experimental adapter)",
             category="model/conditioning/minimax",
-            description="Encode a gaussian-splat .ply into H3 scene tokens (3D-scene adapter prototype, untrained unless adapter_checkpoint is set).",
+            description="Encode a gaussian-splat .ply into a synthetic reference latent grounding H3 in that 3D space (3D-scene adapter prototype, untrained unless adapter_checkpoint is set).",
             inputs=[
                 io.Conditioning.Input("conditioning"),
                 io.String.Input("ply_path", tooltip="Path to a 3DGS .ply (needs x,y,z,f_dc_0-2,opacity,scale_0-2,rot_0-3 vertex fields)"),
-                io.Int.Input("n_tokens", default=48, min=8, max=256, tooltip="Must match adapter_checkpoint's own n_tokens if one is given"),
+                io.Int.Input("h_lat", default=16, min=4, max=64, tooltip="Must match adapter_checkpoint's own h_lat if one is given"),
+                io.Int.Input("w_lat", default=24, min=4, max=64, tooltip="Must match adapter_checkpoint's own w_lat if one is given"),
                 io.Int.Input("subsample", default=200000, min=1000, max=2000000, tooltip="Random subsample of gaussians (CPU/memory tradeoff); scenes run in the hundreds of thousands of splats"),
                 io.String.Input("adapter_checkpoint", default="", optional=True, tooltip="Path to a trained GaussianSceneEncoder state_dict; empty = random-init (plumbing test only, no real conditioning effect)"),
-                io.Float.Input("scene_strength", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Noise-blend strength for the scene tokens, same convention as context_strength/ref_strength"),
+                io.Float.Input("scene_strength", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Noise-blend strength (aug), same convention as ref_strength"),
+                io.Float.Input("scene_spacing", default=1.0, min=0.0, max=50.0, step=0.5, tooltip="RoPE-distance separation from target/context origin, same convention as ref_spacing"),
             ],
             outputs=[io.Conditioning.Output()],
         )
 
     @classmethod
-    def execute(cls, conditioning, ply_path, n_tokens=48, subsample=200000,
-                adapter_checkpoint="", scene_strength=1.0) -> io.NodeOutput:
+    def execute(cls, conditioning, ply_path, h_lat=16, w_lat=24, subsample=200000,
+                adapter_checkpoint="", scene_strength=1.0, scene_spacing=1.0) -> io.NodeOutput:
         import sys
         if _SCENE_ADAPTER_REPO not in sys.path:
             sys.path.insert(0, _SCENE_ADAPTER_REPO)
@@ -509,19 +517,19 @@ class MiniMaxH3SceneFromPLY(io.ComfyNode):
         rot = torch.stack([field("rot_0"), field("rot_1"), field("rot_2"), field("rot_3")], dim=1)
 
         device = comfy.model_management.get_torch_device()
-        encoder = GaussianSceneEncoder(n_tokens=n_tokens)
+        encoder = GaussianSceneEncoder(h_lat=h_lat, w_lat=w_lat)
         if adapter_checkpoint:
             encoder.load_state_dict(torch.load(adapter_checkpoint, map_location="cpu"))
         else:
-            logging.warning("MiniMaxH3SceneFromPLY: no adapter_checkpoint given -- scene tokens are random-init, plumbing test only")
+            logging.warning("MiniMaxH3SceneFromPLY: no adapter_checkpoint given -- scene latent is random-init, plumbing test only")
         encoder.to(device).eval()
         with torch.no_grad():
-            embedding = encoder(xyz.to(device), f_dc.to(device), opacity.to(device), scale.to(device), rot.to(device))
+            latent = encoder(xyz.to(device), f_dc.to(device), opacity.to(device), scale.to(device), rot.to(device))
 
-        scene_kf = {"kind": "scene", "num_tokens": n_tokens,
-                   "hidden_embedding": embedding.to(comfy.model_management.intermediate_device()),
-                   "aug": scene_strength}
-        cond = node_helpers.conditioning_set_values(conditioning, {"minimax_keyframes": [scene_kf]}, append=True)
+        ref_block = {"kind": "image", "latent_h": h_lat, "latent_w": w_lat,
+                    "latent": latent.to(comfy.model_management.intermediate_device()),
+                    "aug": scene_strength, "spacing": scene_spacing}
+        cond = node_helpers.conditioning_set_values(conditioning, {"minimax_refs": [ref_block]}, append=True)
         return io.NodeOutput(cond)
 
 

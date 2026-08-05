@@ -2099,11 +2099,6 @@ class MiniMaxH3(BaseModel):
             kf_audio = [(kf["audio_latent"], kf.get("aug")) for kf in keyframes if "audio_latent" in kf]
             if kf_audio:
                 payload["cond_audio_items"] = kf_audio
-            # scene: already hidden_size tokens from an external 3D-scene adapter,
-            # not a VAE latent -- bypasses cond_video_items/patchify entirely
-            scene_kfs = [kf for kf in keyframes if kf.get("kind") == "scene"]
-            if scene_kfs:
-                payload["scene_embedding"] = torch.cat([kf["hidden_embedding"] for kf in scene_kfs], dim=0)
         refs = kwargs.get("minimax_refs", None)
         if refs is not None:
             payload["refs"] = refs
