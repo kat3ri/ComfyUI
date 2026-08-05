@@ -136,7 +136,7 @@ class MiniMaxH3EncodeAV(io.ComfyNode):
         return io.NodeOutput({"samples": comfy.nested_tensor.NestedTensor((video_z, audio_z))})
 
 
-def _context_keyframes(context_latent, context_frames):
+def _context_keyframes(context_latent, context_frames, context_strength=1.0):
     """Build context/context_audio keyframe dicts continuing a prior generation's AV
     latent, plus the (width, height) it implies. Shared by MiniMaxH3ImageToVideo and
     MiniMaxH3VideoExtend."""
@@ -152,7 +152,7 @@ def _context_keyframes(context_latent, context_frames):
     n_frames = min(context_frames, ctx_t)
     width, height = ctx_w * 16, ctx_h * 16  # inherit the source clip's canvas exactly
 
-    keyframes = [{"kind": "context", "num_frames": n_frames,
+    keyframes = [{"kind": "context", "num_frames": n_frames, "aug": context_strength,
                  "latent": ctx_video[:, :, ctx_t - n_frames:, :, :]}]
     if ctx_audio is not None:
         # match the audio context's duration to the video context's, both ending
@@ -160,7 +160,7 @@ def _context_keyframes(context_latent, context_frames):
         ctx_audio_t = ctx_audio.shape[-1]
         n_audio_frames = min(round(context_span(n_frames)), ctx_audio_t)
         if n_audio_frames > 0:
-            keyframes.append({"kind": "context_audio", "num_frames": n_audio_frames,
+            keyframes.append({"kind": "context_audio", "num_frames": n_audio_frames, "aug": context_strength,
                               "audio_latent": ctx_audio[:, :, :, ctx_audio_t - n_audio_frames:]})
     return width, height, keyframes
 
@@ -197,7 +197,7 @@ class MiniMaxH3ImageToVideo(io.ComfyNode):
                 context_latent=None, context_frames=2, context_strength=1.0) -> io.NodeOutput:
         keyframes = []
         if context_latent is not None:
-            width, height, keyframes = _context_keyframes(context_latent, context_frames)
+            width, height, keyframes = _context_keyframes(context_latent, context_frames, context_strength)
 
         latent, frame_count = _empty_av_latent(width, height, length)
 
@@ -220,11 +220,8 @@ class MiniMaxH3ImageToVideo(io.ComfyNode):
             for kf in keyframes:
                 if "image" in kf:
                     kf["latent"] = vae.encode(kf.pop("image"))
-            values = {"minimax_keyframes": keyframes, "minimax_frame_count": frame_count}
-            if context_latent is not None:
-                values["minimax_visual_cond_noise_aug"] = context_strength
-                values["minimax_audio_cond_noise_aug"] = context_strength
-            cond = node_helpers.conditioning_set_values(cond, values)
+            cond = node_helpers.conditioning_set_values(cond, {
+                "minimax_keyframes": keyframes, "minimax_frame_count": frame_count})
         return io.NodeOutput(cond, latent)
 
 
@@ -239,7 +236,7 @@ def _encode_ref_audio(audio_vae, audio):
 
 
 def _build_ref_blocks(vae, audio_vae, width, height, frame_count, ref_image_size,
-                      ref_images, ref_videos, ref_video_audios, ref_audios, ref_spacing=1.0):
+                      ref_images, ref_videos, ref_video_audios, ref_audios, ref_spacing=1.0, ref_strength=1.0):
     """Shared ref2va block builder: reference images / videos / audio -> (ref_items, ref_blocks).
 
     ref_items feed the tokenizer's <Picture i>/<Video k>/<Audio j> presentation;
@@ -263,7 +260,7 @@ def _build_ref_blocks(vae, audio_vae, width, height, frame_count, ref_image_size
         z = vae.encode(resized)
         ref_items.append({"type": "image", "data": resized})
         ref_blocks.append({"kind": "image", "latent_h": th // 16, "latent_w": tw // 16, "latent": z,
-                          "spacing": ref_spacing})
+                          "spacing": ref_spacing, "aug": ref_strength})
 
     ref_video_audios = ref_video_audios or {}
     for name, video_frames in (ref_videos or {}).items():
@@ -298,14 +295,16 @@ def _build_ref_blocks(vae, audio_vae, width, height, frame_count, ref_image_size
                           "timestamps": [i / 2.0 for i in range(len(sample_idx))]})
         ref_blocks.append({"kind": "video_audio" if ref_audio_t else "video",
                            "latent_t": z.shape[2], "latent_h": ch // 16, "latent_w": cw // 16,
-                           "ref_audio_t": ref_audio_t, "latent": z, "audio_latent": audio_latent})
+                           "ref_audio_t": ref_audio_t, "latent": z, "audio_latent": audio_latent,
+                           "aug": ref_strength})
 
     for audio in (ref_audios or {}).values():
         if audio is None:
             continue
         audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, audio)
         ref_items.append({"type": "audio"})
-        ref_blocks.append({"kind": "audio", "ref_audio_t": ref_audio_t, "audio_latent": audio_latent})
+        ref_blocks.append({"kind": "audio", "ref_audio_t": ref_audio_t, "audio_latent": audio_latent,
+                          "aug": ref_strength})
 
     return ref_items, ref_blocks
 
@@ -315,6 +314,8 @@ _REF_INPUTS = [
         tooltip="Reference image sizing. 'match' scales each ref (down only, keeping aspect) to the generation's pixel area; 'max' uses the reference pipeline's 2048px short edge for best identity fidelity. Reference tokens ride through every sampling step, so 'max' can be several times slower."),
     io.Float.Input("ref_spacing", default=1.0, min=0.0, max=50.0, step=0.5,
         tooltip="RoPE-distance separation between each image ref and the target/context origin. Higher reads to the model as more 'distant reference' vs 'recent/competing' content -- try raising this if refs seem to be drowning out context_latent continuation."),
+    io.Float.Input("ref_strength", default=1.0, min=0.0, max=1.0, step=0.01,
+        tooltip="Independent of ref_spacing: 1.0 = refs stay clean/hard-pinned; lower blends in noise for a softer identity nudge instead of a hard override. Tune this (not spacing) if refs need to keep asserting identity even when spaced far from context."),
     io.Autogrow.Input("ref_images", optional=True,
         template=io.Autogrow.TemplatePrefix(
             input=io.Image.Input("ref_image", tooltip="Reference image (downscaled to 2048 short edge if larger, never upscaled)"),
@@ -365,11 +366,12 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, vae, audio_vae, prompt, width, height, length, ref_image_size="match", ref_spacing=1.0,
-                ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
+                ref_strength=1.0, ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
         latent, frame_count = _empty_av_latent(width, height, length)
 
         ref_items, ref_blocks = _build_ref_blocks(vae, audio_vae, width, height, frame_count, ref_image_size,
-                                                  ref_images, ref_videos, ref_video_audios, ref_audios, ref_spacing)
+                                                  ref_images, ref_videos, ref_video_audios, ref_audios,
+                                                  ref_spacing, ref_strength)
 
         tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
         cond = clip.encode_from_tokens_scheduled(tokens)
@@ -414,9 +416,9 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, vae, context_latent, prompt, length, context_frames=2, context_strength=1.0,
-                audio_vae=None, ref_image_size="match", ref_spacing=1.0,
+                audio_vae=None, ref_image_size="match", ref_spacing=1.0, ref_strength=1.0,
                 ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
-        width, height, keyframes = _context_keyframes(context_latent, context_frames)
+        width, height, keyframes = _context_keyframes(context_latent, context_frames, context_strength)
         latent, frame_count = _empty_av_latent(width, height, length)
 
         ref_items, ref_blocks = ([], [])
@@ -424,14 +426,13 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
             if audio_vae is None and (ref_video_audios or ref_audios):
                 raise ValueError("audio_vae is required when ref_video_audios or ref_audios are supplied")
             ref_items, ref_blocks = _build_ref_blocks(vae, audio_vae, width, height, frame_count, ref_image_size,
-                                                      ref_images, ref_videos, ref_video_audios, ref_audios, ref_spacing)
+                                                      ref_images, ref_videos, ref_video_audios, ref_audios,
+                                                      ref_spacing, ref_strength)
 
         tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
         cond = clip.encode_from_tokens_scheduled(tokens)
 
-        values = {"minimax_keyframes": keyframes, "minimax_frame_count": frame_count,
-                 "minimax_visual_cond_noise_aug": context_strength,
-                 "minimax_audio_cond_noise_aug": context_strength}
+        values = {"minimax_keyframes": keyframes, "minimax_frame_count": frame_count}
         if ref_blocks:
             values["minimax_refs"] = ref_blocks
         cond = node_helpers.conditioning_set_values(cond, values)
