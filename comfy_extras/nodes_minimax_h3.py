@@ -316,6 +316,10 @@ _REF_INPUTS = [
         tooltip="RoPE-distance separation between each image ref and the target/context origin. Higher reads to the model as more 'distant reference' vs 'recent/competing' content -- try raising this if refs seem to be drowning out context_latent continuation."),
     io.Float.Input("ref_strength", default=1.0, min=0.0, max=1.0, step=0.01,
         tooltip="Independent of ref_spacing: 1.0 = refs stay clean/hard-pinned; lower blends in noise for a softer identity nudge instead of a hard override. Tune this (not spacing) if refs need to keep asserting identity even when spaced far from context."),
+    io.Float.Input("ref_decay", default=0.0, min=0.0, max=1.0, step=0.01,
+        tooltip="Attention suppression strength for refs within ref_ramp of the context/target handoff (0 = no suppression -- refs influence the whole clip uniformly). Use with ref_ramp to let context own the transition and refs own identity for the rest of the clip."),
+    io.Float.Input("ref_ramp", default=0.0, min=0.0, max=50.0, step=0.5,
+        tooltip="Width (in the same units as ref_spacing) of the ref-suppression window centered on the context/target handoff. 0 disables the window (ref_decay has no effect). Try a few units first -- refs ramp back to full strength once a query frame is this far past the handoff."),
     io.Autogrow.Input("ref_images", optional=True,
         template=io.Autogrow.TemplatePrefix(
             input=io.Image.Input("ref_image", tooltip="Reference image (downscaled to 2048 short edge if larger, never upscaled)"),
@@ -366,7 +370,8 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, vae, audio_vae, prompt, width, height, length, ref_image_size="match", ref_spacing=1.0,
-                ref_strength=1.0, ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
+                ref_strength=1.0, ref_decay=0.0, ref_ramp=0.0, ref_images=None, ref_videos=None,
+                ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
         latent, frame_count = _empty_av_latent(width, height, length)
 
         ref_items, ref_blocks = _build_ref_blocks(vae, audio_vae, width, height, frame_count, ref_image_size,
@@ -376,7 +381,8 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
         tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
         cond = clip.encode_from_tokens_scheduled(tokens)
         if ref_blocks:
-            cond = node_helpers.conditioning_set_values(cond, {"minimax_refs": ref_blocks})
+            cond = node_helpers.conditioning_set_values(cond, {"minimax_refs": ref_blocks,
+                "minimax_ref_decay": ref_decay, "minimax_ref_ramp": ref_ramp})
         return io.NodeOutput(cond, latent)
 
 
@@ -417,7 +423,8 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
     @classmethod
     def execute(cls, clip, vae, context_latent, prompt, length, context_frames=2, context_strength=1.0,
                 audio_vae=None, ref_image_size="match", ref_spacing=1.0, ref_strength=1.0,
-                ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
+                ref_decay=0.0, ref_ramp=0.0, ref_images=None, ref_videos=None, ref_video_audios=None,
+                ref_audios=None) -> io.NodeOutput:
         width, height, keyframes = _context_keyframes(context_latent, context_frames, context_strength)
         latent, frame_count = _empty_av_latent(width, height, length)
 
@@ -435,6 +442,8 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
         values = {"minimax_keyframes": keyframes, "minimax_frame_count": frame_count}
         if ref_blocks:
             values["minimax_refs"] = ref_blocks
+            values["minimax_ref_decay"] = ref_decay
+            values["minimax_ref_ramp"] = ref_ramp
         cond = node_helpers.conditioning_set_values(cond, values)
         return io.NodeOutput(cond, latent)
 

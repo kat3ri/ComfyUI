@@ -177,7 +177,7 @@ class Attention(nn.Module):
         self.k_norm = operations.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.out_proj = operations.Linear(inner, hidden, bias=False, dtype=dtype, device=device)
 
-    def forward(self, x, rope_freqs=None, transformer_options={}):
+    def forward(self, x, rope_freqs=None, mask=None, transformer_options={}):
         s = x.shape[0]
         q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
         v = v.view(s, self.heads, self.head_dim)
@@ -202,7 +202,7 @@ class Attention(nn.Module):
         q = q.transpose(0, 1).unsqueeze(0)
         k = k.transpose(0, 1).unsqueeze(0)
         v = v.transpose(0, 1).unsqueeze(0)
-        out = optimized_attention(q, k, v, self.heads, mask=None, skip_reshape=True, transformer_options=transformer_options)
+        out = optimized_attention(q, k, v, self.heads, mask=mask, skip_reshape=True, transformer_options=transformer_options)
         return self.out_proj(out.squeeze(0))
 
 
@@ -288,10 +288,10 @@ class DiTBlock(nn.Module):
                                     dtype=adaln_dtype if adaln_dtype is not None else dtype,
                                     device=device, operations=operations)
 
-    def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}):
+    def forward(self, x, t_emb, mod_segments, rope_freqs, mask=None, transformer_options={}):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         h = _mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments)
-        x = _mod_gate(x, gate_msa, self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options), mod_segments)
+        x = _mod_gate(x, gate_msa, self.attn(h, rope_freqs=rope_freqs, mask=mask, transformer_options=transformer_options), mod_segments)
         h = _mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
         return _mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
 
@@ -455,6 +455,7 @@ class PackedLayout:
         row += n_video
 
         self.seq_len = row
+        self.target_origin = target_origin
         self.position_ids = torch.cat(pos)  # [S, 3] float64
         self.img_pos = torch.cat(img_pos)
         self.img_update = torch.cat(img_update)
@@ -473,6 +474,15 @@ class PackedLayout:
             seg_abs.append((off, off + n, kind, aug))
             off += n
         self.segments = seg_abs
+
+        # rows belonging to actual refs (not context, whose zero-distance anchor is
+        # meant to stay strong) -- used to build a distance-decay attention bias so
+        # refs can stay close/available for identity without dominating every frame
+        ref_row_mask = torch.zeros(row, dtype=torch.bool)
+        for a, b, kind, _ in seg_abs:
+            if kind in ("ref_img", "ref_audio"):
+                ref_row_mask[a:b] = True
+        self.ref_row_mask = ref_row_mask
 
 
 class MiniMaxH3Model(nn.Module):
@@ -680,6 +690,25 @@ class MiniMaxH3Model(nn.Module):
         # rotation table computed once per forward, consumed by the kitchen split-half rope
         rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
 
+        # ref-suppression window around target_origin: refs stay muted for a window
+        # around the context/target handoff (letting context own that transition
+        # unimpeded) and ramp back to full strength for the rest of the clip -- anchored
+        # to target_origin (always known/fixed) rather than to unpredictable content
+        # (e.g. wherever a face happens to render), and a smooth ramp rather than a hard
+        # on/off window since RoPE's own periodicity isn't a reliable enough decay at
+        # large custom distances (per the ref_spacing=10 aliasing artifact).
+        attn_bias = None
+        ref_decay = float(payload.get("ref_decay", 0.0))
+        ref_ramp = float(payload.get("ref_ramp", 0.0))
+        ref_row_mask = layout.ref_row_mask.to(device)
+        if ref_decay > 0.0 and ref_ramp > 0.0 and ref_row_mask.any():
+            t_coords = layout.position_ids[:, 0].to(device=device, dtype=torch.float32)
+            dist_from_origin = (t_coords - layout.target_origin).abs()  # per query row
+            gap = (ref_ramp - dist_from_origin).clamp(min=0.0)  # ramps ref_ramp -> 0 near the handoff
+            bias_col = (-ref_decay * gap).to(dtype).unsqueeze(1)  # [S, 1], broadcasts across ref-key columns
+            attn_bias = torch.zeros(layout.seq_len, layout.seq_len, dtype=dtype, device=device)
+            attn_bias[:, ref_row_mask] = bias_col
+
         # blocks
         patches_replace = transformer_options.get("patches_replace", {})
         blocks_replace = patches_replace.get("dit", {})
@@ -689,13 +718,13 @@ class MiniMaxH3Model(nn.Module):
             if ("double_block", i) in blocks_replace:
                 def block_wrap(args):
                     return {"img": block(args["img"], args["t_emb"], args["mod_segments"], args["rope_freqs"],
-                                         transformer_options=args["transformer_options"])}
+                                         mask=args["mask"], transformer_options=args["transformer_options"])}
                 h = blocks_replace[("double_block", i)](
                     {"img": h, "t_emb": t_emb, "mod_segments": mod_segments, "rope_freqs": rope_freqs,
-                     "transformer_options": transformer_options},
+                     "mask": attn_bias, "transformer_options": transformer_options},
                     {"original_block": block_wrap})["img"]
             else:
-                h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
+                h = block(h, t_emb, mod_segments, rope_freqs, mask=attn_bias, transformer_options=transformer_options)
         if prefetch_queue is not None:
             comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
 
