@@ -533,6 +533,117 @@ class MiniMaxH3SceneFromPLY(io.ComfyNode):
         return io.NodeOutput(cond)
 
 
+class MiniMaxH3RenderPLYWalkthrough(io.ComfyNode):
+    """Render a real, VAE-ready video from a complete 3DGS .ply (e.g. a pano
+    reconstructed via midi3d-spike/pano_to_ply.py) by panning in place around
+    its capture origin -- NOT translating, since coverage was only validated
+    to be complete (~98-99.97%) exactly at that point; moving away reveals the
+    same single-viewpoint gaps a raw render always has.
+
+    Output is a plain IMAGE batch (real gsplat renders, no learned encoder,
+    no distribution-mismatch risk) -- wire it directly into
+    MiniMaxH3ReferenceToVideo's ref_video input, which VAE-encodes it the
+    same way it would any other reference video.
+
+    Assumes the .ply's own coordinate frame is Y-up with the capture point at
+    the origin (pano_to_ply.py's convention) -- NOT DA3's raw Y-down camera
+    frame. Check the source of your .ply if results look upside-down.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3RenderPLYWalkthrough",
+            display_name="MiniMax H3 Render PLY Walkthrough",
+            category="model/conditioning/minimax",
+            description="Pan-in-place render of a complete gaussian-splat .ply (e.g. a pano shell) into a real video, for use as an ordinary ref_video reference.",
+            inputs=[
+                io.String.Input("ply_path", tooltip="Path to a complete 3DGS .ply, capture origin at (0,0,0), Y-up (pano_to_ply.py convention)"),
+                io.Int.Input("n_frames", default=48, min=5, max=362, tooltip="Output frame count at 24fps"),
+                io.Float.Input("sweep_deg", default=360.0, min=1.0, max=720.0, tooltip="Total yaw rotation across the clip"),
+                io.Float.Input("start_yaw_deg", default=0.0, min=-360.0, max=360.0),
+                io.Float.Input("fov_deg", default=80.0, min=10.0, max=170.0),
+                io.Int.Input("render_h", default=512, min=64, max=2048, step=16),
+                io.Int.Input("render_w", default=512, min=64, max=2048, step=16),
+                io.Int.Input("max_gaussians", default=2_000_000, min=10_000, max=10_000_000, tooltip="Random subsample cap for render speed/memory"),
+            ],
+            outputs=[io.Image.Output()],
+        )
+
+    @classmethod
+    def execute(cls, ply_path, n_frames=48, sweep_deg=360.0, start_yaw_deg=0.0,
+                fov_deg=80.0, render_h=512, render_w=512, max_gaussians=2_000_000) -> io.NodeOutput:
+        import sys
+        _filmworld_repo = "/weka/home-kateriw/ComfyUI/custom_nodes/ComfyUI-Filmworld"
+        if _filmworld_repo not in sys.path:
+            sys.path.insert(0, _filmworld_repo)
+        import numpy as np
+        from plyfile import PlyData
+        from da3_helper import render_gaussians_at_poses
+
+        C0 = 0.28209479177387814
+        device = comfy.model_management.get_torch_device()
+
+        p = PlyData.read(ply_path)
+        v = p["vertex"].data
+        n = len(v)
+        idx = np.random.default_rng(0).choice(n, size=min(max_gaussians, n), replace=False) if n > max_gaussians else np.arange(n)
+
+        def field(name):
+            return torch.from_numpy(np.ascontiguousarray(v[name][idx]).astype(np.float32))
+
+        xyz = torch.stack([field("x"), field("y"), field("z")], dim=1).to(device)
+        f_dc = torch.stack([field("f_dc_0"), field("f_dc_1"), field("f_dc_2")], dim=1).to(device)
+        opacity_logit = field("opacity").to(device)
+        scale_log = torch.stack([field("scale_0"), field("scale_1"), field("scale_2")], dim=1).to(device)
+        rot = torch.stack([field("rot_0"), field("rot_1"), field("rot_2"), field("rot_3")], dim=1).to(device)
+
+        scales = torch.exp(scale_log)
+        opacities = torch.sigmoid(opacity_logit)
+        rgb_equiv = (0.5 + C0 * f_dc).clamp(1e-6, 1 - 1e-6)
+        dc_presigmoid = torch.logit(rgb_equiv)
+
+        class _GaussiansLike:
+            def __init__(self, means, scales, rotations, opacities, harmonics):
+                self.means, self.scales, self.rotations = means, scales, rotations
+                self.opacities, self.harmonics = opacities, harmonics
+
+        gaussians = _GaussiansLike(
+            means=xyz.unsqueeze(0), scales=scales.unsqueeze(0), rotations=rot.unsqueeze(0),
+            opacities=opacities.unsqueeze(0), harmonics=dc_presigmoid.unsqueeze(0).unsqueeze(-1),
+        )
+
+        # pan in place: fixed position at the capture origin, yaw sweeps
+        # start_yaw_deg -> start_yaw_deg + sweep_deg across n_frames
+        w2cs = []
+        for i in range(n_frames):
+            yaw = math.radians(start_yaw_deg + sweep_deg * (i / max(n_frames - 1, 1)))
+            forward = np.array([math.cos(yaw), 0.0, math.sin(yaw)], dtype=np.float32)
+            down = np.array([0.0, -1.0, 0.0], dtype=np.float32)  # pano_to_ply.py's .ply is Y-up
+            f = forward / max(np.linalg.norm(forward), 1e-9)
+            d = down - np.dot(down, f) * f
+            d /= max(np.linalg.norm(d), 1e-9)
+            r = np.cross(d, f)
+            r /= max(np.linalg.norm(r), 1e-9)
+            c2w = np.eye(4, dtype=np.float32)
+            c2w[:3, 0], c2w[:3, 1], c2w[:3, 2] = r, d, f
+            w2cs.append(np.linalg.inv(c2w))
+        w2cs = torch.from_numpy(np.stack(w2cs).astype(np.float32)).to(device)
+
+        fx = (render_w / 2.0) / math.tan(math.radians(fov_deg) / 2.0)
+        K = torch.zeros(3, 3, dtype=torch.float32, device=device)
+        K[0, 0] = fx; K[1, 1] = fx; K[0, 2] = render_w / 2.0; K[1, 2] = render_h / 2.0; K[2, 2] = 1.0
+        Ks = K.unsqueeze(0).repeat(n_frames, 1, 1)
+
+        rgb, _depth, alpha = render_gaussians_at_poses(gaussians, w2cs, Ks, render_h, render_w, use_sh=False, chunk_size=8)
+        coverage = alpha.mean().item()
+        logging.info(f"MiniMaxH3RenderPLYWalkthrough: {n} gaussians (subsampled to {min(max_gaussians, n)}), "
+                     f"mean alpha coverage {coverage:.4f} across {n_frames} frames")
+
+        images = rgb.clamp(0, 1).to(comfy.model_management.intermediate_device())
+        return io.NodeOutput(images)
+
+
 class MiniMaxH3SigmaShift(io.ComfyNode):
     """Set the video/audio flow shifts coherently.
 
@@ -585,6 +696,7 @@ class MiniMaxH3Extension(ComfyExtension):
             MiniMaxH3ReferenceToVideo,
             MiniMaxH3VideoExtend,
             MiniMaxH3SceneFromPLY,
+            MiniMaxH3RenderPLYWalkthrough,
             MiniMaxH3SigmaShift
             ]
 
