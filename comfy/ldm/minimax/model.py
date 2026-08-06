@@ -375,11 +375,24 @@ class PackedLayout:
                     # first-frame keyframes lock identity so reliably -- rather than a full
                     # frame-duration before it. Earlier context frames step back from there
                     # using their own natural FRAME_PER_TOKEN spacing.
+                    #
+                    # static_time opts out of that stepped-back spacing: every frame sits
+                    # at target_origin instead, all at zero RoPE distance. Use this when
+                    # the context isn't actually "what just happened before this clip" (a
+                    # real prior video, which this mechanism was designed for and where a
+                    # spatial reference like a room's own rendered views), since walking
+                    # them backward through real per-frame time spacing tells the model
+                    # "these are sequential moments" -- which it then reads as literal
+                    # motion to continue (e.g. a rendered orbit's spin gets inherited as
+                    # the generated camera's own opening motion).
                     n_frames = kf["num_frames"]
-                    gaps = torch.tensor([FRAME_RESCALE * FRAME_PER_TOKEN[k % 5] for k in range(-(n_frames - 1), 0)]
-                                        + [0.0], dtype=torch.float64)
-                    dist_from_last = gaps.flip(0).cumsum(0).flip(0)
-                    t_grid = target_origin - dist_from_last
+                    if kf.get("static_time", False):
+                        t_grid = torch.full((n_frames,), target_origin, dtype=torch.float64)
+                    else:
+                        gaps = torch.tensor([FRAME_RESCALE * FRAME_PER_TOKEN[k % 5] for k in range(-(n_frames - 1), 0)]
+                                            + [0.0], dtype=torch.float64)
+                        dist_from_last = gaps.flip(0).cumsum(0).flip(0)
+                        t_grid = target_origin - dist_from_last
                     g = torch.empty(n_frames, frame_rows, 3, dtype=torch.float64)
                     g[:, :, 0] = t_grid[:, None]
                     g[:, :, 1:] = frame[None]

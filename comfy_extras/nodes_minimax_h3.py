@@ -137,10 +137,16 @@ class MiniMaxH3EncodeAV(io.ComfyNode):
         return io.NodeOutput({"samples": comfy.nested_tensor.NestedTensor((video_z, audio_z))})
 
 
-def _context_keyframes(context_latent, context_frames, context_strength=1.0):
+def _context_keyframes(context_latent, context_frames, context_strength=1.0, static_time=False):
     """Build context/context_audio keyframe dicts continuing a prior generation's AV
     latent, plus the (width, height) it implies. Shared by MiniMaxH3ImageToVideo and
-    MiniMaxH3VideoExtend."""
+    MiniMaxH3VideoExtend.
+
+    static_time: pin every context frame to target_origin (zero RoPE distance, all of
+    them) instead of the default stepped-back-through-real-time spacing. Use this when
+    context_latent isn't actually a prior moment in the same continuous clip (e.g. a
+    rendered reference of a space) -- the default spacing tells the model these are
+    sequential instants, which it then reads as motion to continue."""
     ctx_samples = context_latent["samples"]
     # accept either a full AV NestedTensor (from an H3 sampler output) or a
     # plain video-only latent (e.g. a straight VAEEncode of external footage)
@@ -154,6 +160,7 @@ def _context_keyframes(context_latent, context_frames, context_strength=1.0):
     width, height = ctx_w * 16, ctx_h * 16  # inherit the source clip's canvas exactly
 
     keyframes = [{"kind": "context", "num_frames": n_frames, "aug": context_strength,
+                 "static_time": static_time,
                  "latent": ctx_video[:, :, ctx_t - n_frames:, :, :]}]
     if ctx_audio is not None:
         # match the audio context's duration to the video context's, both ending
@@ -188,6 +195,7 @@ class MiniMaxH3ImageToVideo(io.ComfyNode):
                 io.Latent.Input("context_latent", optional=True, tooltip="Continue from a prior MiniMax H3 generation's trailing latent frames (video extension)"),
                 io.Int.Input("context_frames", default=2, min=1, max=64, tooltip="Only used when context_latent is connected: trailing latent frames of context_latent carried over as context"),
                 io.Float.Input("context_strength", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Only used when context_latent is connected: 1.0 = context frames stay clean/hard-pinned; lower blends in noise for a softer handoff"),
+                io.Boolean.Input("context_static_time", default=False, tooltip="Only used when context_latent is connected: pin every context frame to zero RoPE distance instead of stepping them back through real per-frame time spacing. Turn on when context_latent isn't actually a prior moment of the same continuous clip (e.g. a rendered space reference) -- the default spacing reads as 'these are sequential instants' and the model imitates that as motion (e.g. inheriting a rendered orbit's spin)."),
             ],
             outputs=[io.Conditioning.Output(display_name="positive"), io.Latent.Output()],
         )
@@ -195,10 +203,12 @@ class MiniMaxH3ImageToVideo(io.ComfyNode):
     @classmethod
     def execute(cls, clip, vae, prompt, width, height, length,
                 first_frame=None, last_frame=None,
-                context_latent=None, context_frames=2, context_strength=1.0) -> io.NodeOutput:
+                context_latent=None, context_frames=2, context_strength=1.0,
+                context_static_time=False) -> io.NodeOutput:
         keyframes = []
         if context_latent is not None:
-            width, height, keyframes = _context_keyframes(context_latent, context_frames, context_strength)
+            width, height, keyframes = _context_keyframes(context_latent, context_frames, context_strength,
+                                                            static_time=context_static_time)
 
         latent, frame_count = _empty_av_latent(width, height, length)
 
@@ -416,6 +426,7 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
                 io.Int.Input("length", default=124, min=5, max=3600, step=17, tooltip="New frame count at 24 fps for the continuation only (excludes context_frames)"),
                 io.Int.Input("context_frames", default=2, min=1, max=64, tooltip="Trailing latent frames of context_latent carried over as context (1 latent frame covers 1-4 pixel frames)"),
                 io.Float.Input("context_strength", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="1.0 = context frames stay clean/hard-pinned; lower blends in noise for a softer handoff"),
+                io.Boolean.Input("context_static_time", default=False, tooltip="Pin every context frame to zero RoPE distance instead of stepping them back through real per-frame time spacing. Turn on when context_latent isn't actually a prior moment of the same continuous clip (e.g. a rendered space reference) -- the default spacing reads as 'these are sequential instants' and the model imitates that as motion (e.g. inheriting a rendered orbit's spin)."),
                 *_REF_INPUTS,
             ],
             outputs=[io.Conditioning.Output(display_name="positive"), io.Latent.Output()],
@@ -423,10 +434,12 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, vae, context_latent, prompt, length, context_frames=2, context_strength=1.0,
+                context_static_time=False,
                 audio_vae=None, ref_image_size="match", ref_spacing=1.0, ref_strength=1.0,
                 ref_decay=0.0, ref_ramp=0.0, ref_images=None, ref_videos=None, ref_video_audios=None,
                 ref_audios=None) -> io.NodeOutput:
-        width, height, keyframes = _context_keyframes(context_latent, context_frames, context_strength)
+        width, height, keyframes = _context_keyframes(context_latent, context_frames, context_strength,
+                                                        static_time=context_static_time)
         latent, frame_count = _empty_av_latent(width, height, length)
 
         ref_items, ref_blocks = ([], [])
