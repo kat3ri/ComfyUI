@@ -374,26 +374,59 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
                 io.Int.Input("width", default=1344, min=32, max=nodes.MAX_RESOLUTION, step=32),
                 io.Int.Input("height", default=768, min=32, max=nodes.MAX_RESOLUTION, step=32),
                 io.Int.Input("length", default=124, min=5, max=3600, step=17, tooltip="Frame count at 24 fps, (124 = ~5s, trained range is ~124-362)"),
+                io.Image.Input("first_frame", optional=True, tooltip="Pins this call's own frame 0 -- zero RoPE distance, the strongest anchor available (same mechanism as MiniMaxH3ImageToVideo's first_frame). Independent of the refs below, which use offset RoPE positioning instead."),
+                io.Image.Input("last_frame", optional=True, tooltip="Pins this call's own last frame -- same zero-RoPE-distance anchor as first_frame, applied to the end instead."),
                 *_REF_INPUTS,
             ],
             outputs=[io.Conditioning.Output(display_name="positive"), io.Latent.Output()],
         )
 
     @classmethod
-    def execute(cls, clip, vae, audio_vae, prompt, width, height, length, ref_image_size="match", ref_spacing=1.0,
-                ref_strength=1.0, ref_decay=0.0, ref_ramp=0.0, ref_images=None, ref_videos=None,
-                ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
+    def execute(cls, clip, vae, audio_vae, prompt, width, height, length, first_frame=None, last_frame=None,
+                ref_image_size="match", ref_spacing=1.0, ref_strength=1.0, ref_decay=0.0, ref_ramp=0.0,
+                ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
         latent, frame_count = _empty_av_latent(width, height, length)
+
+        keyframes = []
+        keyframe_items = []
+        if first_frame is not None:
+            # geometry anchor: plain stretch to canvas, same convention as MiniMaxH3ImageToVideo
+            img = _resize(first_frame[:1], width, height, "disabled")
+            keyframe_items.append({"type": "image", "data": img})
+            keyframes.append({"resolved_frame_index": 0, "image": img})
+        if last_frame is not None:
+            # follower: aspect-preserving cover-crop, same convention as MiniMaxH3ImageToVideo
+            img = _resize(last_frame[:1], width, height, "center")
+            keyframe_items.append({"type": "image", "data": img})
+            keyframes.append({"resolved_frame_index": frame_count - 1, "image": img})
 
         ref_items, ref_blocks = _build_ref_blocks(vae, audio_vae, width, height, frame_count, ref_image_size,
                                                   ref_images, ref_videos, ref_video_audios, ref_audios,
                                                   ref_spacing, ref_strength)
 
-        tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
+        # tokenize_with_weights treats images= and minimax_ref_items= as
+        # mutually exclusive (an if/else, not additive) -- merge first/last
+        # frame into the SAME ref_items list so both get proper <Picture N>
+        # tags in one consistent numbering, rather than dropping one set
+        # silently. The DiT-conditioning side stays separate: keyframes get
+        # zero-RoPE-distance pinning, refs get offset ref_spacing -- distinct
+        # mechanisms PackedLayout already accepts simultaneously.
+        tokens = clip.tokenize(prompt, minimax_ref_items=keyframe_items + ref_items)
         cond = clip.encode_from_tokens_scheduled(tokens)
+
+        values = {}
+        if keyframes:
+            for kf in keyframes:
+                if "image" in kf:
+                    kf["latent"] = vae.encode(kf.pop("image"))
+            values["minimax_keyframes"] = keyframes
+            values["minimax_frame_count"] = frame_count
         if ref_blocks:
-            cond = node_helpers.conditioning_set_values(cond, {"minimax_refs": ref_blocks,
-                "minimax_ref_decay": ref_decay, "minimax_ref_ramp": ref_ramp})
+            values["minimax_refs"] = ref_blocks
+            values["minimax_ref_decay"] = ref_decay
+            values["minimax_ref_ramp"] = ref_ramp
+        if values:
+            cond = node_helpers.conditioning_set_values(cond, values)
         return io.NodeOutput(cond, latent)
 
 
