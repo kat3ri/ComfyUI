@@ -565,14 +565,14 @@ class MiniMaxH3RenderPLYWalkthrough(io.ComfyNode):
                 io.Float.Input("fov_deg", default=80.0, min=10.0, max=170.0),
                 io.Int.Input("render_h", default=512, min=64, max=2048, step=16),
                 io.Int.Input("render_w", default=512, min=64, max=2048, step=16),
-                io.Int.Input("max_gaussians", default=2_000_000, min=10_000, max=10_000_000, tooltip="Random subsample cap for render speed/memory"),
+                io.Int.Input("max_gaussians", default=10_000_000, min=10_000, max=20_000_000, tooltip="Random subsample cap for render speed/memory -- keep above the .ply's actual point count (e.g. pano_to_ply.py's full-density output is ~8.4M) or its splats, sized for that density, will be too small for the sparser subsample and speckle/holes reappear"),
             ],
             outputs=[io.Image.Output()],
         )
 
     @classmethod
     def execute(cls, ply_path, n_frames=48, sweep_deg=360.0, start_yaw_deg=0.0,
-                fov_deg=80.0, render_h=512, render_w=512, max_gaussians=2_000_000) -> io.NodeOutput:
+                fov_deg=80.0, render_h=512, render_w=512, max_gaussians=10_000_000) -> io.NodeOutput:
         import sys
         _filmworld_repo = "/weka/home-kateriw/ComfyUI/custom_nodes/ComfyUI-Filmworld"
         if _filmworld_repo not in sys.path:
