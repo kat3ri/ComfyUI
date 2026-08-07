@@ -137,6 +137,33 @@ class MiniMaxH3EncodeAV(io.ComfyNode):
         return io.NodeOutput({"samples": comfy.nested_tensor.NestedTensor((video_z, audio_z))})
 
 
+def _pin_last_context_frame(vae, context_latent, width, height):
+    """Decode context_latent's true trailing pixel frame and return a
+    zero-RoPE-distance first_frame-style keyframe for it.
+
+    context_latent's own context block (see _context_keyframes) only carries
+    whole *latent* frames -- each spans 1-4 pixel frames (vae_ratio_t=4) -- so
+    the exact pixel-level state at the handoff is never pinned precisely, just
+    approximated by whichever latent frame happens to land nearest. That
+    ambiguity is enough for the model to occasionally re-play a moment that
+    already happened instead of continuing forward from it. Decoding the real
+    trailing pixels and pinning them as an ordinary first_frame keyframe (the
+    same zero-RoPE-distance anchor MiniMaxH3ImageToVideo already combines with
+    context_latent) removes the ambiguity outright.
+
+    Decodes a few extra trailing latent frames as a buffer before keeping only
+    the very last pixel frame, so the causal VAE's own front-of-sequence
+    transient (decoding a slice as if it were a fresh start) lands safely
+    before the frame actually used."""
+    ctx_samples = context_latent["samples"]
+    ctx_video = ctx_samples.tensors[0] if ctx_samples.is_nested else ctx_samples
+    ctx_t = ctx_video.shape[2]
+    tail = ctx_video[:, :, max(0, ctx_t - 6):, :, :]
+    decoded = vae.decode(tail)
+    img = _resize(decoded[:, -1], width, height, "disabled")
+    return {"resolved_frame_index": 0, "image": img}
+
+
 def _context_keyframes(context_latent, context_frames, context_strength=1.0, static_time=False, expect_hw=None):
     """Build context/context_audio keyframe dicts continuing a prior generation's AV
     latent, plus the (width, height) it implies. Shared by MiniMaxH3ImageToVideo and
@@ -468,6 +495,7 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
                 io.Int.Input("context_frames", default=2, min=1, max=64, tooltip="Trailing latent frames of context_latent carried over as context (1 latent frame covers 1-4 pixel frames)"),
                 io.Boolean.Input("context_static_time", default=False, tooltip="Pin every context frame to zero RoPE distance instead of stepping them back through real per-frame time spacing. Turn on when context_latent isn't actually a prior moment of the same continuous clip (e.g. a rendered space reference) -- the default spacing reads as 'these are sequential instants' and the model imitates that as motion (e.g. inheriting a rendered orbit's spin)."),
                 io.Float.Input("context_strength", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="1.0 = context frames stay clean/hard-pinned; lower blends in noise for a softer handoff"),
+                io.Boolean.Input("pin_last_frame", default=True, tooltip="Decode context_latent's true trailing pixel frame and pin it as this call's own frame 0 (same zero-RoPE-distance anchor as an explicit first_frame). context_frames alone only carries whole latent frames (each spanning 1-4 pixel frames), leaving the exact handoff state a little ambiguous -- pinning the real decoded pixels removes that ambiguity, which otherwise can show up as the continuation re-playing a moment that already happened."),
                 io.Latent.Input("world_latent", optional=True, tooltip="Second, independent context block -- e.g. a rendered room/scene reference -- kept separate from context_latent so that slot stays free for real prior-clip continuation. Must share context_latent's exact canvas. Chained immediately behind context_latent's own context frames in RoPE time (not colliding with them)."),
                 io.Int.Input("world_frames", default=2, min=1, max=64, tooltip="Only used when world_latent is connected: trailing latent frames of world_latent carried over as context"),
                 io.Float.Input("world_strength", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Only used when world_latent is connected: 1.0 = context frames stay clean/hard-pinned; lower blends in noise for a softer handoff"),
@@ -479,13 +507,15 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, vae, context_latent, prompt, length, context_frames=2, context_strength=1.0,
-                context_static_time=False,
+                context_static_time=False, pin_last_frame=True,
                 world_latent=None, world_frames=2, world_strength=1.0, world_static_time=False,
                 audio_vae=None, ref_image_size="match", ref_spacing=1.0, ref_strength=1.0,
                 ref_decay=0.0, ref_ramp=0.0, ref_images=None, ref_videos=None, ref_video_audios=None,
                 ref_audios=None) -> io.NodeOutput:
         width, height, keyframes = _context_keyframes(context_latent, context_frames, context_strength,
                                                         static_time=context_static_time)
+        if pin_last_frame:
+            keyframes.append(_pin_last_context_frame(vae, context_latent, width, height))
         if world_latent is not None:
             # chained behind context_latent's own context block (appended after it in
             # the list) -- see PackedLayout's context_cursor for the chaining mechanism
@@ -505,6 +535,10 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
 
         tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
         cond = clip.encode_from_tokens_scheduled(tokens)
+
+        for kf in keyframes:
+            if "image" in kf:
+                kf["latent"] = vae.encode(kf.pop("image"))
 
         values = {"minimax_keyframes": keyframes, "minimax_frame_count": frame_count}
         if ref_blocks:
