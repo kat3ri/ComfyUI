@@ -750,6 +750,131 @@ class MiniMaxH3RenderPLYWalkthrough(io.ComfyNode):
         return io.NodeOutput(images)
 
 
+class MiniMaxH3RenderPLYCutoutViews(io.ComfyNode):
+    """Experimental alternative to MiniMaxH3RenderPLYWalkthrough: instead of one
+    smooth panning sweep (a real camera move, which the model reads as motion to
+    continue -- see context_static_time's failure mode), render a batch of
+    DISCRETE still yaw positions around the .ply's capture origin, spaced so each
+    neighbor overlaps by a set fraction of the field of view.
+
+    The idea being tested: since these views aren't consecutive frames of one
+    continuous move, feeding them as ordinary ref_images (Autogrow, each its own
+    independent spatial grid and RoPE position -- no shared frame_grid like
+    context/world_latent's "cond" mechanism has) might let the model build a
+    coherent sense of the room's layout from several independent stills, without
+    inheriting a fabricated camera motion the way a swept video can.
+
+    Deliberately a separate node from MiniMaxH3RenderPLYWalkthrough -- same
+    gaussian-loading and rendering code, just a different, discrete camera
+    schedule -- so the validated walkthrough+context_latent recipe is untouched
+    while this alternative gets tried.
+
+    Same .ply coordinate-frame assumption as MiniMaxH3RenderPLYWalkthrough:
+    Y-up, capture origin at (0,0,0) (pano_to_ply.py's convention).
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3RenderPLYCutoutViews",
+            display_name="MiniMax H3 Render PLY Cutout Views",
+            category="model/conditioning/minimax",
+            is_experimental=True,
+            description="Discrete, overlapping still views around a .ply's capture origin (not a smooth sweep) -- wire the output batch into separate ref_image slots to test whether several static cutouts ground the model better than a swept reference video.",
+            inputs=[
+                io.String.Input("ply_path", tooltip="Path to a complete 3DGS .ply, capture origin at (0,0,0), Y-up (pano_to_ply.py convention)"),
+                io.Float.Input("overlap_percent", default=25.0, min=0.0, max=90.0, tooltip="Target overlap between each view and its neighbor, as a fraction of fov_deg. Together with fov_deg this determines how many views are needed to cover the full 360 degrees (ignored if num_views is set > 0)."),
+                io.Int.Input("num_views", default=0, min=0, max=32, tooltip="Explicit view count, evenly spaced across 360 degrees. 0 = auto-compute from overlap_percent and fov_deg."),
+                io.Float.Input("start_yaw_deg", default=0.0, min=-360.0, max=360.0),
+                io.Float.Input("fov_deg", default=80.0, min=10.0, max=170.0),
+                io.Int.Input("render_h", default=512, min=64, max=2048, step=16),
+                io.Int.Input("render_w", default=512, min=64, max=2048, step=16),
+                io.Int.Input("max_gaussians", default=10_000_000, min=10_000, max=20_000_000, tooltip="Random subsample cap for render speed/memory -- keep above the .ply's actual point count or splats will be too small for the sparser subsample and speckle/holes reappear"),
+            ],
+            outputs=[io.Image.Output(tooltip="One still per view, in yaw order -- wire individual frames (e.g. via ImageFromBatch) into separate ref_image Autogrow slots")],
+        )
+
+    @classmethod
+    def execute(cls, ply_path, overlap_percent=25.0, num_views=0, start_yaw_deg=0.0,
+                fov_deg=80.0, render_h=512, render_w=512, max_gaussians=10_000_000) -> io.NodeOutput:
+        import sys
+        _filmworld_repo = "/weka/home-kateriw/ComfyUI/custom_nodes/ComfyUI-Filmworld"
+        if _filmworld_repo not in sys.path:
+            sys.path.insert(0, _filmworld_repo)
+        import numpy as np
+        from plyfile import PlyData
+        from da3_helper import render_gaussians_at_poses
+
+        C0 = 0.28209479177387814
+        device = comfy.model_management.get_torch_device()
+
+        if num_views > 0:
+            n_views = num_views
+        else:
+            step_deg = fov_deg * (1.0 - overlap_percent / 100.0)
+            n_views = max(1, math.ceil(360.0 / max(step_deg, 1e-6)))
+
+        p = PlyData.read(ply_path)
+        v = p["vertex"].data
+        n = len(v)
+        idx = np.random.default_rng(0).choice(n, size=min(max_gaussians, n), replace=False) if n > max_gaussians else np.arange(n)
+
+        def field(name):
+            return torch.from_numpy(np.ascontiguousarray(v[name][idx]).astype(np.float32))
+
+        xyz = torch.stack([field("x"), field("y"), field("z")], dim=1).to(device)
+        f_dc = torch.stack([field("f_dc_0"), field("f_dc_1"), field("f_dc_2")], dim=1).to(device)
+        opacity_logit = field("opacity").to(device)
+        scale_log = torch.stack([field("scale_0"), field("scale_1"), field("scale_2")], dim=1).to(device)
+        rot = torch.stack([field("rot_0"), field("rot_1"), field("rot_2"), field("rot_3")], dim=1).to(device)
+
+        scales = torch.exp(scale_log)
+        opacities = torch.sigmoid(opacity_logit)
+        rgb_equiv = (0.5 + C0 * f_dc).clamp(1e-6, 1 - 1e-6)
+        dc_presigmoid = torch.logit(rgb_equiv)
+
+        class _GaussiansLike:
+            def __init__(self, means, scales, rotations, opacities, harmonics):
+                self.means, self.scales, self.rotations = means, scales, rotations
+                self.opacities, self.harmonics = opacities, harmonics
+
+        gaussians = _GaussiansLike(
+            means=xyz.unsqueeze(0), scales=scales.unsqueeze(0), rotations=rot.unsqueeze(0),
+            opacities=opacities.unsqueeze(0), harmonics=dc_presigmoid.unsqueeze(0).unsqueeze(-1),
+        )
+
+        # discrete, evenly-spaced yaw positions -- each an independent still, not
+        # frames of one continuous move (contrast with MiniMaxH3RenderPLYWalkthrough)
+        w2cs = []
+        for i in range(n_views):
+            yaw = math.radians(start_yaw_deg + 360.0 * (i / n_views))
+            forward = np.array([math.cos(yaw), 0.0, math.sin(yaw)], dtype=np.float32)
+            down = np.array([0.0, -1.0, 0.0], dtype=np.float32)  # pano_to_ply.py's .ply is Y-up
+            f = forward / max(np.linalg.norm(forward), 1e-9)
+            d = down - np.dot(down, f) * f
+            d /= max(np.linalg.norm(d), 1e-9)
+            r = np.cross(d, f)
+            r /= max(np.linalg.norm(r), 1e-9)
+            c2w = np.eye(4, dtype=np.float32)
+            c2w[:3, 0], c2w[:3, 1], c2w[:3, 2] = r, d, f
+            w2cs.append(np.linalg.inv(c2w))
+        w2cs = torch.from_numpy(np.stack(w2cs).astype(np.float32)).to(device)
+
+        fx = (render_w / 2.0) / math.tan(math.radians(fov_deg) / 2.0)
+        K = torch.zeros(3, 3, dtype=torch.float32, device=device)
+        K[0, 0] = fx; K[1, 1] = fx; K[0, 2] = render_w / 2.0; K[1, 2] = render_h / 2.0; K[2, 2] = 1.0
+        Ks = K.unsqueeze(0).repeat(n_views, 1, 1)
+
+        rgb, _depth, alpha = render_gaussians_at_poses(gaussians, w2cs, Ks, render_h, render_w, use_sh=False, chunk_size=8)
+        coverage = alpha.mean().item()
+        logging.info(f"MiniMaxH3RenderPLYCutoutViews: {n_views} discrete views, step {360.0 / n_views:.1f} deg "
+                     f"(fov {fov_deg} deg), {n} gaussians (subsampled to {min(max_gaussians, n)}), "
+                     f"mean alpha coverage {coverage:.4f}")
+
+        images = rgb.clamp(0, 1).to(comfy.model_management.intermediate_device())
+        return io.NodeOutput(images)
+
+
 class MiniMaxH3SigmaShift(io.ComfyNode):
     """Set the video/audio flow shifts coherently.
 
@@ -803,6 +928,7 @@ class MiniMaxH3Extension(ComfyExtension):
             MiniMaxH3VideoExtend,
             MiniMaxH3SceneFromPLY,
             MiniMaxH3RenderPLYWalkthrough,
+            MiniMaxH3RenderPLYCutoutViews,
             MiniMaxH3SigmaShift
             ]
 
