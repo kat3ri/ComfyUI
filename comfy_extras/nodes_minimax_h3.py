@@ -495,7 +495,8 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
                 io.Int.Input("context_frames", default=2, min=1, max=64, tooltip="Trailing latent frames of context_latent carried over as context (1 latent frame covers 1-4 pixel frames)"),
                 io.Boolean.Input("context_static_time", default=False, tooltip="Pin every context frame to zero RoPE distance instead of stepping them back through real per-frame time spacing. Turn on when context_latent isn't actually a prior moment of the same continuous clip (e.g. a rendered space reference) -- the default spacing reads as 'these are sequential instants' and the model imitates that as motion (e.g. inheriting a rendered orbit's spin)."),
                 io.Float.Input("context_strength", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="1.0 = context frames stay clean/hard-pinned; lower blends in noise for a softer handoff"),
-                io.Boolean.Input("pin_last_frame", default=True, tooltip="Decode context_latent's true trailing pixel frame and pin it as this call's own frame 0 (same zero-RoPE-distance anchor as an explicit first_frame). context_frames alone only carries whole latent frames (each spanning 1-4 pixel frames), leaving the exact handoff state a little ambiguous -- pinning the real decoded pixels removes that ambiguity, which otherwise can show up as the continuation re-playing a moment that already happened."),
+                io.Boolean.Input("pin_last_frame", default=True, tooltip="Decode context_latent's true trailing pixel frame and pin it as this call's own frame 0 (same zero-RoPE-distance anchor as first_frame below). context_frames alone only carries whole latent frames (each spanning 1-4 pixel frames), leaving the exact handoff state a little ambiguous -- pinning the real decoded pixels removes that ambiguity, which otherwise can show up as the continuation re-playing a moment that already happened. Ignored if first_frame is connected."),
+                io.Image.Input("first_frame", optional=True, tooltip="Hard-pin this call's own frame 0 to an exact image you supply (e.g. the prior clip's actual last output frame), instead of pin_last_frame's own decode of context_latent. Use this if pin_last_frame's decode-of-a-latent-slice roundtrip is introducing a color-grade mismatch at the handoff -- feeding the real pixels directly skips that roundtrip entirely."),
                 io.Latent.Input("world_latent", optional=True, tooltip="Second, independent context block -- e.g. a rendered room/scene reference -- kept separate from context_latent so that slot stays free for real prior-clip continuation. Must share context_latent's exact canvas. Chained immediately behind context_latent's own context frames in RoPE time (not colliding with them)."),
                 io.Int.Input("world_frames", default=2, min=1, max=64, tooltip="Only used when world_latent is connected: trailing latent frames of world_latent carried over as context"),
                 io.Float.Input("world_strength", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Only used when world_latent is connected: 1.0 = context frames stay clean/hard-pinned; lower blends in noise for a softer handoff"),
@@ -507,14 +508,19 @@ class MiniMaxH3VideoExtend(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, vae, context_latent, prompt, length, context_frames=2, context_strength=1.0,
-                context_static_time=False, pin_last_frame=True,
+                context_static_time=False, pin_last_frame=True, first_frame=None,
                 world_latent=None, world_frames=2, world_strength=1.0, world_static_time=False,
                 audio_vae=None, ref_image_size="match", ref_spacing=1.0, ref_strength=1.0,
                 ref_decay=0.0, ref_ramp=0.0, ref_images=None, ref_videos=None, ref_video_audios=None,
                 ref_audios=None) -> io.NodeOutput:
         width, height, keyframes = _context_keyframes(context_latent, context_frames, context_strength,
                                                         static_time=context_static_time)
-        if pin_last_frame:
+        if first_frame is not None:
+            # exact pixels supplied directly -- skips the decode-of-a-latent-slice
+            # roundtrip pin_last_frame does, which can shift color grade slightly
+            img = _resize(first_frame[:1], width, height, "disabled")
+            keyframes.append({"resolved_frame_index": 0, "image": img})
+        elif pin_last_frame:
             keyframes.append(_pin_last_context_frame(vae, context_latent, width, height))
         if world_latent is not None:
             # chained behind context_latent's own context block (appended after it in
