@@ -367,32 +367,62 @@ class PackedLayout:
 
         if keyframes:
             # fl2va: keyframe cond rows right after text, sharing the target spatial grid
+            #
+            # multiple "context" keyframes chain back-to-back through one shared,
+            # continuously-decreasing k-index rather than each independently
+            # anchoring at target_origin (which would collide). context_k_cursor
+            # tracks the next UNOCCUPIED slot in that timeline: k=0 is
+            # target_origin itself (the classic zero-RoPE-distance anchor), and
+            # each non-static block consumes n_frames slots going further back,
+            # continuing the same FRAME_PER_TOKEN cycle a single block would have
+            # used -- so a second context block (e.g. a world-grounding latent
+            # chained behind a real prior-clip continuation latent) lands at its
+            # own strictly-further-back positions instead of overlapping.
+            context_k_cursor = 0
+
+            def _context_k_distance(k):
+                # distance from target_origin for slot k (k<=0); k=0 is the hard
+                # zero-distance override, k=-m sums the natural per-step cycle
+                # for m steps back -- exactly what a single block's own gaps
+                # computation did, just able to keep going past one block's
+                # n_frames instead of resetting.
+                if k >= 0:
+                    return 0.0
+                m = -k
+                return sum(FRAME_RESCALE * FRAME_PER_TOKEN[(-i) % 5] for i in range(1, m + 1))
+
+            audio_context_cursor = target_origin
             for kf in keyframes:
                 if kf.get("kind") == "context":
                     # video-extend: n_frames trailing latent frames of a prior clip. The
-                    # LAST context frame is anchored at target_origin itself -- zero RoPE
-                    # distance from this call's own frame 0, the same trick that makes
-                    # first-frame keyframes lock identity so reliably -- rather than a full
-                    # frame-duration before it. Earlier context frames step back from there
-                    # using their own natural FRAME_PER_TOKEN spacing.
+                    # LAST context frame is anchored at target_origin itself (or, for a
+                    # second/later context block, wherever the previous block's chain left
+                    # off) -- zero RoPE distance from this call's own frame 0, the same
+                    # trick that makes first-frame keyframes lock identity so reliably --
+                    # rather than a full frame-duration before it. Earlier context frames
+                    # step back from there using their own natural FRAME_PER_TOKEN spacing.
                     #
                     # static_time opts out of that stepped-back spacing: every frame sits
-                    # at target_origin instead, all at zero RoPE distance. Use this when
-                    # the context isn't actually "what just happened before this clip" (a
-                    # real prior video, which this mechanism was designed for and where a
-                    # spatial reference like a room's own rendered views), since walking
-                    # them backward through real per-frame time spacing tells the model
-                    # "these are sequential moments" -- which it then reads as literal
-                    # motion to continue (e.g. a rendered orbit's spin gets inherited as
-                    # the generated camera's own opening motion).
+                    # at the block's own (single, unoccupied) slot instead, all at the same
+                    # RoPE distance from target_origin. Use this when the context isn't
+                    # actually "what just happened before this clip" (a real prior video,
+                    # which this mechanism was designed for) but a spatial reference like a
+                    # room's own rendered views, since walking them backward through real
+                    # per-frame time spacing tells the model "these are sequential
+                    # instants" -- which it then reads as literal motion to continue (e.g.
+                    # inheriting a rendered orbit's spin as the generated camera's own
+                    # opening motion). A static_time block only reserves one slot so
+                    # whatever context block comes next still lands cleanly behind it.
                     n_frames = kf["num_frames"]
                     if kf.get("static_time", False):
-                        t_grid = torch.full((n_frames,), target_origin, dtype=torch.float64)
+                        cursor_pos = target_origin - _context_k_distance(context_k_cursor)
+                        t_grid = torch.full((n_frames,), cursor_pos, dtype=torch.float64)
+                        context_k_cursor -= 1
                     else:
-                        gaps = torch.tensor([FRAME_RESCALE * FRAME_PER_TOKEN[k % 5] for k in range(-(n_frames - 1), 0)]
-                                            + [0.0], dtype=torch.float64)
-                        dist_from_last = gaps.flip(0).cumsum(0).flip(0)
-                        t_grid = target_origin - dist_from_last
+                        ks = range(context_k_cursor - n_frames + 1, context_k_cursor + 1)
+                        t_grid = torch.tensor([target_origin - _context_k_distance(k) for k in ks],
+                                              dtype=torch.float64)
+                        context_k_cursor -= n_frames
                     g = torch.empty(n_frames, frame_rows, 3, dtype=torch.float64)
                     g[:, :, 0] = t_grid[:, None]
                     g[:, :, 1:] = frame[None]
@@ -406,12 +436,15 @@ class PackedLayout:
                 if kf.get("kind") == "context_audio":
                     # audio counterpart of the video-extend context block above: rt trailing
                     # audio-latent steps (uniform duration, unlike video's weighted cycle)
-                    # ending immediately before the target's own audio.
+                    # ending immediately before audio_context_cursor -- chained the same way
+                    # as the video context blocks above, so a second context_audio block (from
+                    # a second, independent context-latent slot) doesn't collide with the first.
                     rt = kf["num_frames"]
                     segments.append(("ref_audio", rt * 2, kf.get("aug")))
-                    pos.append(_audio_grid(target_origin - rt, rt, *target_audio_w))
+                    pos.append(_audio_grid(audio_context_cursor - rt, rt, *target_audio_w))
                     audio_pos.append(torch.arange(row, row + rt * 2))
                     audio_update.append(torch.zeros(rt * 2, dtype=torch.bool))
+                    audio_context_cursor -= rt
                     row += rt * 2
                     continue
                 pixel_index = kf["resolved_frame_index"]
