@@ -754,7 +754,8 @@ class MiniMaxH3RenderPLYCutoutViews(io.ComfyNode):
     """Experimental alternative to MiniMaxH3RenderPLYWalkthrough: instead of one
     smooth panning sweep (a real camera move, which the model reads as motion to
     continue -- see context_static_time's failure mode), render a batch of
-    DISCRETE still yaw positions around the .ply's capture origin, spaced so each
+    DISCRETE still positions around the .ply's capture origin -- a yaw ring at
+    each of several pitch rows (looking level, up, down) -- spaced so each
     neighbor overlaps by a set fraction of the field of view.
 
     The idea being tested: since these views aren't consecutive frames of one
@@ -784,7 +785,9 @@ class MiniMaxH3RenderPLYCutoutViews(io.ComfyNode):
             inputs=[
                 io.String.Input("ply_path", tooltip="Path to a complete 3DGS .ply, capture origin at (0,0,0), Y-up (pano_to_ply.py convention)"),
                 io.Float.Input("overlap_percent", default=25.0, min=0.0, max=90.0, tooltip="Target overlap between each view and its neighbor, as a fraction of fov_deg. Together with fov_deg this determines how many views are needed to cover the full 360 degrees (ignored if num_views is set > 0)."),
-                io.Int.Input("num_views", default=0, min=0, max=32, tooltip="Explicit view count, evenly spaced across 360 degrees. 0 = auto-compute from overlap_percent and fov_deg."),
+                io.Int.Input("num_views", default=0, min=0, max=32, tooltip="Explicit view count per pitch row, evenly spaced across 360 degrees of yaw. 0 = auto-compute from overlap_percent and fov_deg."),
+                io.Int.Input("num_pitch_rows", default=3, min=1, max=9, tooltip="How many pitch rows to render a full yaw ring at (1 = level only, like the old behavior). E.g. 3 = looking down, level, and up."),
+                io.Float.Input("pitch_max_deg", default=45.0, min=0.0, max=85.0, tooltip="Extreme up/down tilt for the outermost pitch rows (rows are evenly spaced from -pitch_max_deg to +pitch_max_deg). Ignored if num_pitch_rows is 1."),
                 io.Float.Input("start_yaw_deg", default=0.0, min=-360.0, max=360.0),
                 io.Float.Input("fov_deg", default=80.0, min=10.0, max=170.0),
                 io.Int.Input("render_h", default=512, min=64, max=2048, step=16),
@@ -795,8 +798,8 @@ class MiniMaxH3RenderPLYCutoutViews(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, ply_path, overlap_percent=25.0, num_views=0, start_yaw_deg=0.0,
-                fov_deg=80.0, render_h=512, render_w=512, max_gaussians=10_000_000) -> io.NodeOutput:
+    def execute(cls, ply_path, overlap_percent=25.0, num_views=0, num_pitch_rows=3, pitch_max_deg=45.0,
+                start_yaw_deg=0.0, fov_deg=80.0, render_h=512, render_w=512, max_gaussians=10_000_000) -> io.NodeOutput:
         import sys
         _filmworld_repo = "/weka/home-kateriw/ComfyUI/custom_nodes/ComfyUI-Filmworld"
         if _filmworld_repo not in sys.path:
@@ -809,10 +812,17 @@ class MiniMaxH3RenderPLYCutoutViews(io.ComfyNode):
         device = comfy.model_management.get_torch_device()
 
         if num_views > 0:
-            n_views = num_views
+            n_views_per_row = num_views
         else:
             step_deg = fov_deg * (1.0 - overlap_percent / 100.0)
-            n_views = max(1, math.ceil(360.0 / max(step_deg, 1e-6)))
+            n_views_per_row = max(1, math.ceil(360.0 / max(step_deg, 1e-6)))
+
+        if num_pitch_rows <= 1:
+            pitches_deg = [0.0]
+        else:
+            pitches_deg = [-pitch_max_deg + 2.0 * pitch_max_deg * (i / (num_pitch_rows - 1))
+                          for i in range(num_pitch_rows)]
+        n_views = n_views_per_row * len(pitches_deg)
 
         p = PlyData.read(ply_path)
         v = p["vertex"].data
@@ -843,21 +853,26 @@ class MiniMaxH3RenderPLYCutoutViews(io.ComfyNode):
             opacities=opacities.unsqueeze(0), harmonics=dc_presigmoid.unsqueeze(0).unsqueeze(-1),
         )
 
-        # discrete, evenly-spaced yaw positions -- each an independent still, not
-        # frames of one continuous move (contrast with MiniMaxH3RenderPLYWalkthrough)
+        # discrete, evenly-spaced yaw x pitch positions -- each an independent
+        # still, not frames of one continuous move (contrast with
+        # MiniMaxH3RenderPLYWalkthrough). +pitch looks up, -pitch looks down
+        # (Y-up convention, matching down=[0,-1,0] below).
         w2cs = []
-        for i in range(n_views):
-            yaw = math.radians(start_yaw_deg + 360.0 * (i / n_views))
-            forward = np.array([math.cos(yaw), 0.0, math.sin(yaw)], dtype=np.float32)
-            down = np.array([0.0, -1.0, 0.0], dtype=np.float32)  # pano_to_ply.py's .ply is Y-up
-            f = forward / max(np.linalg.norm(forward), 1e-9)
-            d = down - np.dot(down, f) * f
-            d /= max(np.linalg.norm(d), 1e-9)
-            r = np.cross(d, f)
-            r /= max(np.linalg.norm(r), 1e-9)
-            c2w = np.eye(4, dtype=np.float32)
-            c2w[:3, 0], c2w[:3, 1], c2w[:3, 2] = r, d, f
-            w2cs.append(np.linalg.inv(c2w))
+        for pitch_deg in pitches_deg:
+            pitch = math.radians(pitch_deg)
+            for i in range(n_views_per_row):
+                yaw = math.radians(start_yaw_deg + 360.0 * (i / n_views_per_row))
+                forward = np.array([math.cos(pitch) * math.cos(yaw), math.sin(pitch),
+                                    math.cos(pitch) * math.sin(yaw)], dtype=np.float32)
+                down = np.array([0.0, -1.0, 0.0], dtype=np.float32)  # pano_to_ply.py's .ply is Y-up
+                f = forward / max(np.linalg.norm(forward), 1e-9)
+                d = down - np.dot(down, f) * f
+                d /= max(np.linalg.norm(d), 1e-9)
+                r = np.cross(d, f)
+                r /= max(np.linalg.norm(r), 1e-9)
+                c2w = np.eye(4, dtype=np.float32)
+                c2w[:3, 0], c2w[:3, 1], c2w[:3, 2] = r, d, f
+                w2cs.append(np.linalg.inv(c2w))
         w2cs = torch.from_numpy(np.stack(w2cs).astype(np.float32)).to(device)
 
         fx = (render_w / 2.0) / math.tan(math.radians(fov_deg) / 2.0)
@@ -867,8 +882,9 @@ class MiniMaxH3RenderPLYCutoutViews(io.ComfyNode):
 
         rgb, _depth, alpha = render_gaussians_at_poses(gaussians, w2cs, Ks, render_h, render_w, use_sh=False, chunk_size=8)
         coverage = alpha.mean().item()
-        logging.info(f"MiniMaxH3RenderPLYCutoutViews: {n_views} discrete views, step {360.0 / n_views:.1f} deg "
-                     f"(fov {fov_deg} deg), {n} gaussians (subsampled to {min(max_gaussians, n)}), "
+        logging.info(f"MiniMaxH3RenderPLYCutoutViews: {n_views} discrete views ({len(pitches_deg)} pitch rows x "
+                     f"{n_views_per_row} yaw steps of {360.0 / n_views_per_row:.1f} deg, pitches {pitches_deg}), "
+                     f"fov {fov_deg} deg, {n} gaussians (subsampled to {min(max_gaussians, n)}), "
                      f"mean alpha coverage {coverage:.4f}")
 
         images = rgb.clamp(0, 1).to(comfy.model_management.intermediate_device())
