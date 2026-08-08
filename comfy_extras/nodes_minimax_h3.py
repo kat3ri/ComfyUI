@@ -231,6 +231,7 @@ class MiniMaxH3ImageToVideo(io.ComfyNode):
                 io.Int.Input("context_frames", default=2, min=1, max=64, tooltip="Only used when context_latent is connected: trailing latent frames of context_latent carried over as context"),
                 io.Float.Input("context_strength", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Only used when context_latent is connected: 1.0 = context frames stay clean/hard-pinned; lower blends in noise for a softer handoff"),
                 io.Boolean.Input("context_static_time", default=False, tooltip="Only used when context_latent is connected: pin every context frame to zero RoPE distance instead of stepping them back through real per-frame time spacing. Turn on when context_latent isn't actually a prior moment of the same continuous clip (e.g. a rendered space reference) -- the default spacing reads as 'these are sequential instants' and the model imitates that as motion (e.g. inheriting a rendered orbit's spin)."),
+                io.Float.Input("temporal_stretch", default=1.0, min=1.0, max=100.0, step=0.5, tooltip="Spread the generated frames' RoPE time-positions apart by this factor, so a short clip occupies the time-span of a longer one -- its frames read as sparse keyframes of a long video instead of a dense burst (ChronoEdit-style skip-RoPE). 1.0 = normal. Experimental: intended for few-frame still/transition generation at short lengths, e.g. length 5 with stretch ~30 spans what ~124 frames normally would."),
             ],
             outputs=[io.Conditioning.Output(display_name="positive"), io.Latent.Output()],
         )
@@ -239,7 +240,7 @@ class MiniMaxH3ImageToVideo(io.ComfyNode):
     def execute(cls, clip, vae, prompt, width, height, length,
                 first_frame=None, last_frame=None,
                 context_latent=None, context_frames=2, context_strength=1.0,
-                context_static_time=False) -> io.NodeOutput:
+                context_static_time=False, temporal_stretch=1.0) -> io.NodeOutput:
         keyframes = []
         if context_latent is not None:
             width, height, keyframes = _context_keyframes(context_latent, context_frames, context_strength,
@@ -262,12 +263,17 @@ class MiniMaxH3ImageToVideo(io.ComfyNode):
         tokens = clip.tokenize(prompt, images=images)
         cond = clip.encode_from_tokens_scheduled(tokens)
 
+        values = {}
         if keyframes:
             for kf in keyframes:
                 if "image" in kf:
                     kf["latent"] = vae.encode(kf.pop("image"))
-            cond = node_helpers.conditioning_set_values(cond, {
-                "minimax_keyframes": keyframes, "minimax_frame_count": frame_count})
+            values["minimax_keyframes"] = keyframes
+            values["minimax_frame_count"] = frame_count
+        if temporal_stretch > 1.0:
+            values["minimax_temporal_stretch"] = temporal_stretch
+        if values:
+            cond = node_helpers.conditioning_set_values(cond, values)
         return io.NodeOutput(cond, latent)
 
 
@@ -411,6 +417,7 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
                 io.Int.Input("length", default=124, min=5, max=3600, step=17, tooltip="Frame count at 24 fps, (124 = ~5s, trained range is ~124-362)"),
                 io.Image.Input("first_frame", optional=True, tooltip="Pins this call's own frame 0 -- zero RoPE distance, the strongest anchor available (same mechanism as MiniMaxH3ImageToVideo's first_frame). Independent of the refs below, which use offset RoPE positioning instead."),
                 io.Image.Input("last_frame", optional=True, tooltip="Pins this call's own last frame -- same zero-RoPE-distance anchor as first_frame, applied to the end instead."),
+                io.Float.Input("temporal_stretch", default=1.0, min=1.0, max=100.0, step=0.5, tooltip="Spread the generated frames' RoPE time-positions apart by this factor, so a short clip occupies the time-span of a longer one -- its frames read as sparse keyframes of a long video instead of a dense burst (ChronoEdit-style skip-RoPE). 1.0 = normal. Experimental: intended for few-frame still/transition generation at short lengths, e.g. length 5 with stretch ~30 spans what ~124 frames normally would."),
                 *_REF_INPUTS,
             ],
             outputs=[io.Conditioning.Output(display_name="positive"), io.Latent.Output()],
@@ -418,6 +425,7 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, vae, audio_vae, prompt, width, height, length, first_frame=None, last_frame=None,
+                temporal_stretch=1.0,
                 ref_image_size="match", ref_spacing=1.0, ref_strength=1.0, ref_decay=0.0, ref_ramp=0.0,
                 ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
         latent, frame_count = _empty_av_latent(width, height, length)
@@ -460,6 +468,8 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
             values["minimax_refs"] = ref_blocks
             values["minimax_ref_decay"] = ref_decay
             values["minimax_ref_ramp"] = ref_ramp
+        if temporal_stretch > 1.0:
+            values["minimax_temporal_stretch"] = temporal_stretch
         if values:
             cond = node_helpers.conditioning_set_values(cond, values)
         return io.NodeOutput(cond, latent)

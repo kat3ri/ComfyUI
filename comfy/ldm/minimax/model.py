@@ -345,7 +345,21 @@ class FinalLayer(nn.Module):
 class PackedLayout:
     """Static packed-sequence structure for one shape/conditioning signature."""
 
-    def __init__(self, text_len, latent_t, latent_h, latent_w, audio_t, keyframes=None, refs=None, frame_count=None):
+    def __init__(self, text_len, latent_t, latent_h, latent_w, audio_t, keyframes=None, refs=None, frame_count=None,
+                 temporal_stretch=1.0):
+        # temporal_stretch > 1 spreads the TARGET video frames' t-positions apart by
+        # that factor, so a short clip occupies the RoPE time-span of a much longer
+        # one -- its frames read as sparse keyframes of a long video rather than a
+        # dense burst (ChronoEdit's TemproalSkipVideoRopePosition3DEmb, ported to
+        # H3's packed layout). 1.0 is exactly the unstretched original behavior.
+        # Only the target video (and its last_frame keyframe anchor, which must
+        # stay pinned to the final frame's actual position) is affected: context
+        # blocks step BACKWARD from target_origin and refs sit on their own cursor
+        # axis, so both keep their validated positioning, and the target audio grid
+        # is left unstretched too -- at the short lengths this exists for, audio is
+        # degenerate/discarded anyway, and stretching it would shift the AV
+        # alignment the model trained with for no benefit.
+        temporal_stretch = max(float(temporal_stretch), 1.0)
         frame, w_grid = _frame_grid(latent_h, latent_w)
         frame_rows = frame.shape[0]
 
@@ -451,7 +465,7 @@ class PackedLayout:
                 if pixel_index == 0:
                     cond_t = target_origin
                 elif frame_count is not None and pixel_index == frame_count - 1:
-                    cond_t = target_origin + sum(_video_t_spans(latent_t)) - FRAME_RESCALE
+                    cond_t = target_origin + temporal_stretch * (sum(_video_t_spans(latent_t)) - FRAME_RESCALE)
                 else:
                     raise ValueError("only first/last keyframe anchors are supported")
                 g = torch.empty(frame_rows, 3, dtype=torch.float64)
@@ -525,7 +539,13 @@ class PackedLayout:
 
         n_video = latent_t * frame_rows
         segments.append(("video", n_video, None))
-        pos.append(_video_grid(latent_t, frame, cursor))
+        if temporal_stretch != 1.0:
+            g = torch.empty(latent_t, frame_rows, 3, dtype=torch.float64)
+            g[:, :, 0] = (float(cursor) + (_video_t_grid(latent_t, 0.0) * temporal_stretch))[:, None]
+            g[:, :, 1:] = frame[None]
+            pos.append(g.reshape(-1, 3))
+        else:
+            pos.append(_video_grid(latent_t, frame, cursor))
         img_pos.append(torch.arange(row, row + n_video))
         img_update.append(torch.ones(n_video, dtype=torch.bool))
         row += n_video
@@ -674,7 +694,8 @@ class MiniMaxH3Model(nn.Module):
             layout = PackedLayout(text_len, latent_t, lat_h, lat_w, audio_t,
                                   keyframes=payload.get("keyframes"),
                                   refs=payload.get("refs"),
-                                  frame_count=payload.get("frame_count"))
+                                  frame_count=payload.get("frame_count"),
+                                  temporal_stretch=payload.get("temporal_stretch", 1.0))
 
         # model_base passes model_sampling.timestep(sigma) = sigma * 1000
         shift_v = float(transformer_options.get("minimax_h3_sigma_shift_video", self.sigma_shift_video))

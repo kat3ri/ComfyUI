@@ -2109,6 +2109,8 @@ class MiniMaxH3(BaseModel):
             payload["ref_decay"] = kwargs["minimax_ref_decay"]
         if kwargs.get("minimax_ref_ramp", None) is not None:
             payload["ref_ramp"] = kwargs["minimax_ref_ramp"]
+        if kwargs.get("minimax_temporal_stretch", None) is not None:
+            payload["temporal_stretch"] = kwargs["minimax_temporal_stretch"]
         payload["seed"] = kwargs.get("seed", 0)
         if cross_attn is not None and latent_shapes is not None and len(latent_shapes) > 1:
             # packed layout built once per sampling run, h/w rounded up to the DiT's 2x2 patch
@@ -2116,7 +2118,8 @@ class MiniMaxH3(BaseModel):
             payload["layout"] = comfy.ldm.minimax.model.PackedLayout(
                 cross_attn.shape[1], vs[2], (vs[3] + 1) // 2 * 2, (vs[4] + 1) // 2 * 2,
                 latent_shapes[1][-1], keyframes=payload.get("keyframes"),
-                refs=payload.get("refs"), frame_count=payload.get("frame_count"))
+                refs=payload.get("refs"), frame_count=payload.get("frame_count"),
+                temporal_stretch=payload.get("temporal_stretch", 1.0))
         out['minimax_payload'] = comfy.conds.CONDConstant(payload)
         return out
 
