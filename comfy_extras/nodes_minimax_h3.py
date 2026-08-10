@@ -944,6 +944,125 @@ class MiniMaxH3SigmaShift(io.ComfyNode):
         return io.NodeOutput(m)
 
 
+class _SceneTokenProj(torch.nn.Module):
+    """[N, in_ch] scene tokens -> [N, hidden]; mirrors the training-side
+    SceneProj (h3-3d-adapter/scripts/train_scene3d_smoke.py). Kept fp32 and
+    dtype/device-robust regardless of what the surrounding model was cast to."""
+
+    def __init__(self, in_ch, hidden):
+        super().__init__()
+        self.net = torch.nn.Sequential(torch.nn.Linear(in_ch, 1024), torch.nn.GELU(),
+                                       torch.nn.Linear(1024, hidden))
+
+    def forward(self, x):
+        w = self.net[0].weight
+        return self.net(x.to(device=w.device, dtype=w.dtype))
+
+
+class MiniMaxH3SceneAdapterLoader(io.ComfyNode):
+    """Attach a trained scene3d adapter (token projector + attention LoRA,
+    trained by h3-3d-adapter/scripts/train_scene3d_*.py) onto the H3 DiT so
+    MiniMaxH3SceneLatent conditioning has a pathway into the model.
+
+    Research-grade: mutates the loaded diffusion model in place (LoRA is a
+    forward-wrap, not a ComfyUI weight patch), so it affects every workflow
+    sharing that loaded UNet until strength is set to 0 or the UNet is
+    reloaded. Re-executing with a different checkpoint/strength updates the
+    attached adapter rather than stacking."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3SceneAdapterLoader",
+            display_name="MiniMax H3 Scene Adapter Loader (experimental)",
+            category="model/patch/minimax",
+            description="Load a trained scene3d adapter checkpoint (proj + LoRA) onto the H3 model. In-place research patch: reload the UNet to fully remove.",
+            inputs=[
+                io.Model.Input("model"),
+                io.String.Input("adapter_path", tooltip="Path to a scene3d adapter .pt ({proj, lora, rank, in_ch}), e.g. /weka/home-kateriw/h3-3d-adapter/checkpoints/scene3d_adapter_v2.pt"),
+                io.Float.Input("strength", default=1.0, min=0.0, max=2.0, step=0.05, tooltip="LoRA scale multiplier (0 = LoRA off; projector stays attached)"),
+            ],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, adapter_path, strength=1.0) -> io.NodeOutput:
+        ck = torch.load(adapter_path, map_location="cpu")
+        dm = model.model.diffusion_model
+
+        proj = _SceneTokenProj(ck["in_ch"], dm.hidden_size)
+        proj.load_state_dict(ck["proj"])
+        proj.float()
+        dm.scene3d_proj = proj
+
+        rank = ck["rank"]
+        base_scale = 16.0 / rank  # alpha=16, matches training
+        if not hasattr(dm, "_scene3d_lora"):
+            state = {"scale": base_scale * strength}
+            params = []
+            for block in dm.blocks:
+                for lin in (block.attn.qkv_proj, block.attn.out_proj):
+                    A = torch.nn.Parameter(torch.zeros(rank, lin.in_features), requires_grad=False)
+                    B = torch.nn.Parameter(torch.zeros(lin.out_features, rank), requires_grad=False)
+                    orig = lin.forward
+
+                    def fwd(x, _orig=orig, _A=A, _B=B, _state=state):
+                        y = _orig(x)
+                        if _state["scale"] == 0.0:
+                            return y
+                        if _A.device != x.device:
+                            _A.data = _A.data.to(x.device)
+                            _B.data = _B.data.to(x.device)
+                        return y + ((x.float() @ _A.t()) @ _B.t() * _state["scale"]).to(y.dtype)
+
+                    lin.forward = fwd
+                    params += [A, B]
+            dm._scene3d_lora = params
+            dm._scene3d_lora_state = state
+        if len(dm._scene3d_lora) != len(ck["lora"]):
+            raise RuntimeError(f"adapter rank mismatch: model has {len(dm._scene3d_lora)} LoRA tensors attached, checkpoint has {len(ck['lora'])}; reload the UNet before switching ranks")
+        with torch.no_grad():
+            for p, saved in zip(dm._scene3d_lora, ck["lora"]):
+                p.data = saved.float().to(p.device)
+        dm._scene3d_lora_state["scale"] = base_scale * strength
+        logging.info(f"MiniMaxH3SceneAdapterLoader: attached {adapter_path} (rank {rank}, strength {strength}, step {ck.get('step', '?')})")
+        return io.NodeOutput(model)
+
+
+class MiniMaxH3SceneLatent(io.ComfyNode):
+    """Condition H3 on a whole room: appends a scene3d refs block carrying
+    XCube scene tokens ([N, 11] = 8ch geometry latent + 3ch pooled RGB,
+    exported by scene3d_eval/export_scene3d_tokens.py). Requires the scene3d
+    adapter to be attached via MiniMaxH3SceneAdapterLoader -- tokens without
+    the adapter raise at sampling time by design."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3SceneLatent",
+            display_name="MiniMax H3 Scene Latent (experimental)",
+            category="model/conditioning/minimax",
+            description="Append XCube scene-3D tokens (the 4th modality) to the conditioning. Pair with MiniMax H3 Scene Adapter Loader.",
+            inputs=[
+                io.Conditioning.Input("conditioning"),
+                io.String.Input("tokens_path", tooltip="Path to a scene tokens .pt ({geom, rgb}), e.g. /weka/home-kateriw/scene3d_eval/out/hotel_scene3d_tokens.pt"),
+                io.Float.Input("scene_strength", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="aug value on the refs block, same convention as ref_strength"),
+                io.Float.Input("scene_spacing", default=1.0, min=0.0, max=50.0, step=0.5, tooltip="RoPE-distance separation on the refs cursor chain, same convention as ref_spacing"),
+            ],
+            outputs=[io.Conditioning.Output()],
+        )
+
+    @classmethod
+    def execute(cls, conditioning, tokens_path, scene_strength=1.0, scene_spacing=1.0) -> io.NodeOutput:
+        tok = torch.load(tokens_path, map_location="cpu")
+        tokens = torch.cat([tok["geom"], tok["rgb"]], dim=1).float()
+        ref_block = {"kind": "scene3d", "num_tokens": int(tokens.shape[0]), "tokens": tokens,
+                     "spacing": scene_spacing, "aug": scene_strength}
+        cond = node_helpers.conditioning_set_values(conditioning, {"minimax_refs": [ref_block]}, append=True)
+        logging.info(f"MiniMaxH3SceneLatent: {tokens.shape[0]} tokens x {tokens.shape[1]}ch from {tokens_path}")
+        return io.NodeOutput(cond)
+
+
 class MiniMaxH3Extension(ComfyExtension):
     async def get_node_list(self):
         return [
@@ -955,7 +1074,9 @@ class MiniMaxH3Extension(ComfyExtension):
             MiniMaxH3SceneFromPLY,
             MiniMaxH3RenderPLYWalkthrough,
             MiniMaxH3RenderPLYCutoutViews,
-            MiniMaxH3SigmaShift
+            MiniMaxH3SigmaShift,
+            MiniMaxH3SceneAdapterLoader,
+            MiniMaxH3SceneLatent
             ]
 
 
