@@ -418,6 +418,10 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
                 io.Image.Input("first_frame", optional=True, tooltip="Pins this call's own frame 0 -- zero RoPE distance, the strongest anchor available (same mechanism as MiniMaxH3ImageToVideo's first_frame). Independent of the refs below, which use offset RoPE positioning instead."),
                 io.Image.Input("last_frame", optional=True, tooltip="Pins this call's own last frame -- same zero-RoPE-distance anchor as first_frame, applied to the end instead."),
                 io.Float.Input("temporal_stretch", default=1.0, min=1.0, max=100.0, step=0.5, tooltip="Spread the generated frames' RoPE time-positions apart by this factor, so a short clip occupies the time-span of a longer one -- its frames read as sparse keyframes of a long video instead of a dense burst (ChronoEdit-style skip-RoPE). 1.0 = normal. Experimental: intended for few-frame still/transition generation at short lengths, e.g. length 5 with stretch ~30 spans what ~124 frames normally would."),
+                io.Latent.Input("world_latent", optional=True, tooltip="World-grounding context latent (e.g. MiniMaxH3SceneToContextLatent's output, or a VAE-encoded room render) pinned as context rows at the target's RoPE origin -- the latent-input half of the grounding recipe, in addition to refs conditioning. Must share this node's exact canvas (width/height)."),
+                io.Int.Input("world_frames", default=1, min=1, max=64, tooltip="Only used when world_latent is connected: trailing latent frames carried over as context"),
+                io.Float.Input("world_strength", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Only used when world_latent is connected: 1.0 = context frames stay clean/hard-pinned; lower blends in noise"),
+                io.Boolean.Input("world_static_time", default=True, tooltip="Only used when world_latent is connected: pin every context frame to a single zero-RoPE-distance point instead of stepping back through per-frame time. Keep True for spatial references (a room), False only for genuine prior-clip footage."),
                 *_REF_INPUTS,
             ],
             outputs=[io.Conditioning.Output(display_name="positive"), io.Latent.Output()],
@@ -426,6 +430,7 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
     @classmethod
     def execute(cls, clip, vae, audio_vae, prompt, width, height, length, first_frame=None, last_frame=None,
                 temporal_stretch=1.0,
+                world_latent=None, world_frames=1, world_strength=1.0, world_static_time=True,
                 ref_image_size="match", ref_spacing=1.0, ref_strength=1.0, ref_decay=0.0, ref_ramp=0.0,
                 ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
         latent, frame_count = _empty_av_latent(width, height, length)
@@ -443,6 +448,14 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
             keyframe_items.append({"type": "image", "data": img})
             keyframes.append({"resolved_frame_index": frame_count - 1, "image": img})
 
+        world_keyframes = []
+        if world_latent is not None:
+            # latent-input grounding: pinned context rows at the target's RoPE
+            # origin, same slot machinery as VideoExtend's world_latent
+            _, _, world_keyframes = _context_keyframes(world_latent, world_frames, world_strength,
+                                                       static_time=world_static_time,
+                                                       expect_hw=(height // 16, width // 16))
+
         ref_items, ref_blocks = _build_ref_blocks(vae, audio_vae, width, height, frame_count, ref_image_size,
                                                   ref_images, ref_videos, ref_video_audios, ref_audios,
                                                   ref_spacing, ref_strength)
@@ -458,11 +471,11 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
         cond = clip.encode_from_tokens_scheduled(tokens)
 
         values = {}
-        if keyframes:
+        if keyframes or world_keyframes:
             for kf in keyframes:
                 if "image" in kf:
                     kf["latent"] = vae.encode(kf.pop("image"))
-            values["minimax_keyframes"] = keyframes
+            values["minimax_keyframes"] = keyframes + world_keyframes
             values["minimax_frame_count"] = frame_count
         if ref_blocks:
             values["minimax_refs"] = ref_blocks
@@ -1070,6 +1083,56 @@ class MiniMaxH3SceneLatent(io.ComfyNode):
         return io.NodeOutput(cond)
 
 
+class MiniMaxH3SceneToContextLatent(io.ComfyNode):
+    """The latent-input half of the scene grounding recipe: run the adapter's
+    trained SceneContextHead over the XCube scene tokens to produce a pseudo
+    context latent in the video VAE's latent space, and output it as a plain
+    LATENT -- wire it into `world_latent` (set world_static_time=True,
+    world_frames = the head's ctx_frames) on ReferenceToVideo/VideoExtend.
+    The model reads it through its native, pretrained context machinery
+    (video_patch_proj), in addition to the SceneLatent conditioning tokens.
+
+    Requires an adapter checkpoint trained WITH --context-head; older
+    refs-only checkpoints have no head and raise."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3SceneToContextLatent",
+            display_name="MiniMax H3 Scene To Context Latent (experimental)",
+            category="model/conditioning/minimax",
+            description="Trained head: XCube scene tokens -> pseudo world/context latent. Plug into world_latent (world_static_time=True).",
+            inputs=[
+                io.String.Input("tokens_path", tooltip="Path to a scene tokens .pt ({geom, rgb})"),
+                io.String.Input("adapter_path", tooltip="Adapter .pt trained with --context-head (carries the SceneContextHead weights + ctx_frames)"),
+                io.Int.Input("width", default=320, min=32, max=nodes.MAX_RESOLUTION, step=32, tooltip="Must match the generation canvas exactly (world_latent contract). Head was trained at 320x192; other canvases are extrapolation."),
+                io.Int.Input("height", default=192, min=32, max=nodes.MAX_RESOLUTION, step=32),
+            ],
+            outputs=[io.Latent.Output(display_name="world_latent")],
+        )
+
+    @classmethod
+    def execute(cls, tokens_path, adapter_path, width=320, height=192) -> io.NodeOutput:
+        import sys
+        scripts = _SCENE_ADAPTER_REPO + "/scripts"
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        from scene_context_head import SceneContextHead
+
+        ck = torch.load(adapter_path, map_location="cpu")
+        if ck.get("context_head") is None:
+            raise ValueError(f"{adapter_path} has no context head -- it was trained without --context-head (the latent path). Use a v3+ adapter.")
+        head = SceneContextHead(ck["in_ch"]).eval()
+        head.load_state_dict(ck["context_head"])
+        tok = torch.load(tokens_path, map_location="cpu")
+        tokens = torch.cat([tok["geom"], tok["rgb"]], dim=1).float()
+        ctx_frames = ck.get("ctx_frames", 1)
+        with torch.no_grad():
+            lat = head(tokens, ctx_frames, height // 16, width // 16)
+        logging.info(f"MiniMaxH3SceneToContextLatent: {tokens.shape[0]} tokens -> pseudo context latent {tuple(lat.shape)} (wire world_frames={ctx_frames}, world_static_time=True)")
+        return io.NodeOutput({"samples": lat})
+
+
 class MiniMaxH3Extension(ComfyExtension):
     async def get_node_list(self):
         return [
@@ -1083,7 +1146,8 @@ class MiniMaxH3Extension(ComfyExtension):
             MiniMaxH3RenderPLYCutoutViews,
             MiniMaxH3SigmaShift,
             MiniMaxH3SceneAdapterLoader,
-            MiniMaxH3SceneLatent
+            MiniMaxH3SceneLatent,
+            MiniMaxH3SceneToContextLatent
             ]
 
 
