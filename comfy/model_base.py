@@ -2107,7 +2107,12 @@ class MiniMaxH3(BaseModel):
             # collections below skip them by construction)
             payload["cond_video_items"] = payload.get("cond_video_items", []) + [(r["latent"], r.get("aug")) for r in refs if "latent" in r]
             payload["cond_audio_items"] = payload.get("cond_audio_items", []) + [(r["audio_latent"], r.get("aug")) for r in refs if r.get("audio_latent") is not None]
-            scene3d = [r["tokens"] for r in refs if r.get("kind") == "scene3d"]
+            # order must match PackedLayout's row order: context-placed scene3d
+            # bags are laid out on the context chain BEFORE the refs region, so
+            # their tokens come first; the forward pass fills scene3d rows from
+            # scene3d_items sequentially.
+            scene3d = ([r["tokens"] for r in refs if r.get("kind") == "scene3d" and r.get("placement") == "context"]
+                       + [r["tokens"] for r in refs if r.get("kind") == "scene3d" and r.get("placement") != "context"])
             if scene3d:
                 payload["scene3d_items"] = scene3d
         if kwargs.get("minimax_ref_decay", None) is not None:

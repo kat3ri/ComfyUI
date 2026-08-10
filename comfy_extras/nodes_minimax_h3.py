@@ -1046,20 +1046,27 @@ class MiniMaxH3SceneLatent(io.ComfyNode):
             inputs=[
                 io.Conditioning.Input("conditioning"),
                 io.String.Input("tokens_path", tooltip="Path to a scene tokens .pt ({geom, rgb}), e.g. /weka/home-kateriw/scene3d_eval/out/hotel_scene3d_tokens.pt"),
+                io.Combo.Input("placement", options=["refs", "context", "both"], default="refs",
+                               tooltip="refs = distant reference material on the refs cursor chain (inside ref_decay/ref_ramp). context = world-latent-style anchor at the target's own RoPE origin, outside the ref window (spacing ignored -- the context-chain slot IS the position). both = one block each. Must match how the adapter was trained."),
                 io.Float.Input("scene_strength", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="aug value on the refs block, same convention as ref_strength"),
-                io.Float.Input("scene_spacing", default=1.0, min=0.0, max=50.0, step=0.5, tooltip="RoPE-distance separation on the refs cursor chain, same convention as ref_spacing"),
+                io.Float.Input("scene_spacing", default=1.0, min=0.0, max=50.0, step=0.5, tooltip="RoPE-distance separation on the refs cursor chain (refs placement only), same convention as ref_spacing"),
             ],
             outputs=[io.Conditioning.Output()],
         )
 
     @classmethod
-    def execute(cls, conditioning, tokens_path, scene_strength=1.0, scene_spacing=1.0) -> io.NodeOutput:
+    def execute(cls, conditioning, tokens_path, placement="refs", scene_strength=1.0, scene_spacing=1.0) -> io.NodeOutput:
         tok = torch.load(tokens_path, map_location="cpu")
         tokens = torch.cat([tok["geom"], tok["rgb"]], dim=1).float()
-        ref_block = {"kind": "scene3d", "num_tokens": int(tokens.shape[0]), "tokens": tokens,
-                     "spacing": scene_spacing, "aug": scene_strength}
-        cond = node_helpers.conditioning_set_values(conditioning, {"minimax_refs": [ref_block]}, append=True)
-        logging.info(f"MiniMaxH3SceneLatent: {tokens.shape[0]} tokens x {tokens.shape[1]}ch from {tokens_path}")
+        blocks = []
+        if placement in ("refs", "both"):
+            blocks.append({"kind": "scene3d", "num_tokens": int(tokens.shape[0]), "tokens": tokens,
+                           "spacing": scene_spacing, "aug": scene_strength})
+        if placement in ("context", "both"):
+            blocks.append({"kind": "scene3d", "num_tokens": int(tokens.shape[0]), "tokens": tokens,
+                           "placement": "context", "spacing": 0.0, "aug": scene_strength})
+        cond = node_helpers.conditioning_set_values(conditioning, {"minimax_refs": blocks}, append=True)
+        logging.info(f"MiniMaxH3SceneLatent: {tokens.shape[0]} tokens x {tokens.shape[1]}ch from {tokens_path} (placement={placement})")
         return io.NodeOutput(cond)
 
 

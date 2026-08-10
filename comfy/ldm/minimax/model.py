@@ -136,7 +136,10 @@ def _refs_cursor_delta(refs):
         if kind == "image":
             delta += blk.get("spacing", 1.0)
         elif kind == "scene3d":
-            delta += blk.get("spacing", 1.0)
+            # context-placed scene bags live on the context chain behind
+            # target_origin, not on the refs cursor -- no delta contribution
+            if blk.get("placement") != "context":
+                delta += blk.get("spacing", 1.0)
         elif kind == "audio":
             delta += float(blk["ref_audio_t"])
         elif kind in ("video", "video_audio"):
@@ -381,32 +384,33 @@ class PackedLayout:
         # that eventual origin, so its delta is precomputed here.
         target_origin = float(text_len) + (_refs_cursor_delta(refs) if refs else 0.0)
 
+        # multiple "context" keyframes chain back-to-back through one shared,
+        # continuously-decreasing k-index rather than each independently
+        # anchoring at target_origin (which would collide). context_k_cursor
+        # tracks the next UNOCCUPIED slot in that timeline: k=0 is
+        # target_origin itself (the classic zero-RoPE-distance anchor), and
+        # each non-static block consumes n_frames slots going further back,
+        # continuing the same FRAME_PER_TOKEN cycle a single block would have
+        # used -- so a second context block (e.g. a world-grounding latent
+        # chained behind a real prior-clip continuation latent) lands at its
+        # own strictly-further-back positions instead of overlapping. Shared
+        # by keyframe context blocks AND context-placed scene3d bags below,
+        # so the two never collide either.
+        context_k_cursor = 0
+
+        def _context_k_distance(k):
+            # distance from target_origin for slot k (k<=0); k=0 is the hard
+            # zero-distance override, k=-m sums the natural per-step cycle
+            # for m steps back -- exactly what a single block's own gaps
+            # computation did, just able to keep going past one block's
+            # n_frames instead of resetting.
+            if k >= 0:
+                return 0.0
+            m = -k
+            return sum(FRAME_RESCALE * FRAME_PER_TOKEN[(-i) % 5] for i in range(1, m + 1))
+
         if keyframes:
             # fl2va: keyframe cond rows right after text, sharing the target spatial grid
-            #
-            # multiple "context" keyframes chain back-to-back through one shared,
-            # continuously-decreasing k-index rather than each independently
-            # anchoring at target_origin (which would collide). context_k_cursor
-            # tracks the next UNOCCUPIED slot in that timeline: k=0 is
-            # target_origin itself (the classic zero-RoPE-distance anchor), and
-            # each non-static block consumes n_frames slots going further back,
-            # continuing the same FRAME_PER_TOKEN cycle a single block would have
-            # used -- so a second context block (e.g. a world-grounding latent
-            # chained behind a real prior-clip continuation latent) lands at its
-            # own strictly-further-back positions instead of overlapping.
-            context_k_cursor = 0
-
-            def _context_k_distance(k):
-                # distance from target_origin for slot k (k<=0); k=0 is the hard
-                # zero-distance override, k=-m sums the natural per-step cycle
-                # for m steps back -- exactly what a single block's own gaps
-                # computation did, just able to keep going past one block's
-                # n_frames instead of resetting.
-                if k >= 0:
-                    return 0.0
-                m = -k
-                return sum(FRAME_RESCALE * FRAME_PER_TOKEN[(-i) % 5] for i in range(1, m + 1))
-
             audio_context_cursor = target_origin
             for kf in keyframes:
                 if kf.get("kind") == "context":
@@ -479,6 +483,32 @@ class PackedLayout:
                 img_update.append(torch.zeros(frame_rows, dtype=torch.bool))
                 row += frame_rows
 
+        # context-placed scene3d bags: the "latent input" half of the
+        # empirically-validated grounding recipe (conditioning refs + context
+        # latent). Same unordered-bag geometry as the refs-placed variant, but
+        # anchored where a context latent would sit: at (or, when real context
+        # latents already claimed slots, chained just behind) target_origin --
+        # zero RoPE distance reads as "the world this clip starts inside" vs a
+        # refs bag's "distant reference material". Consumes ONE k-slot like a
+        # static_time context block, so continuation latents and this bag
+        # never collide; spacing is deliberately ignored here (the chain slot
+        # IS the position). Laid out before refs_row_start, so ref_decay/
+        # ref_ramp do NOT apply. NOTE: keep this ordering in sync with
+        # model_base's scene3d_items extraction (context items first).
+        if refs:
+            for blk in refs:
+                if blk["kind"] == "scene3d" and blk.get("placement") == "context":
+                    n = int(blk["num_tokens"])
+                    cursor_pos = target_origin - _context_k_distance(context_k_cursor)
+                    context_k_cursor -= 1
+                    g = torch.empty(n, 3, dtype=torch.float64)
+                    g[:, 0] = cursor_pos
+                    g[:, 1] = float(frame[:, 0].mean())
+                    g[:, 2] = float(frame[:, 1].mean())
+                    segments.append(("scene3d", n, blk.get("aug")))
+                    pos.append(g)
+                    row += n
+
         # refs form one contiguous row range (this loop runs entirely after keyframes,
         # which is where context_audio's rows -- confusingly also tagged "ref_audio" for
         # adaln purposes -- already landed); marking by row range instead of kind string
@@ -512,6 +542,8 @@ class PackedLayout:
                     # in _forward (external projector), not cond_video_items.
                     # Sitting inside the refs row range means ref_decay/ref_ramp
                     # apply to them like any other reference.
+                    if blk.get("placement") == "context":
+                        continue  # laid out on the context chain above, before refs_row_start
                     n = int(blk["num_tokens"])
                     g = torch.empty(n, 3, dtype=torch.float64)
                     g[:, 0] = cursor
