@@ -307,13 +307,14 @@ class TokenRefiner(nn.Module):
 
 class DiTBlock(nn.Module):
     def __init__(self, hidden, heads, head_dim, ffn, t_dim, eps, qk_eps,
-                 apply_silu=True, adaln_dtype=None, dtype=None, device=None, operations=None):
+                 apply_silu=True, adaln_dtype=None, adaln_modalities=3,
+                 dtype=None, device=None, operations=None):
         super().__init__()
         self.norm1 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.norm2 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.attn = Attention(hidden, heads, head_dim, qk_eps, dtype=dtype, device=device, operations=operations)
         self.mlp = MLP(hidden, ffn, dtype=dtype, device=device, operations=operations)
-        self.adaln_proj = AdalnProj(t_dim, hidden, 6, 3, apply_silu=apply_silu,
+        self.adaln_proj = AdalnProj(t_dim, hidden, 6, adaln_modalities, apply_silu=apply_silu,
                                     dtype=adaln_dtype if adaln_dtype is not None else dtype,
                                     device=device, operations=operations)
 
@@ -635,6 +636,67 @@ class PackedLayout:
         self.ref_row_mask = ref_row_mask
 
 
+class SceneTokenProj(nn.Module):
+    """[N, in_ch] measured scene tokens -> [N, hidden]. Native form of the
+    scene input pathway (surgery grafts these keys zero-init on the out
+    layer). fp32 regardless of surrounding model dtype."""
+
+    def __init__(self, in_ch, hidden, device=None):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(in_ch, 1024, dtype=torch.float32, device=device),
+                                 nn.GELU(),
+                                 nn.Linear(1024, hidden, dtype=torch.float32, device=device))
+
+    def forward(self, x):
+        w = self.net[0].weight
+        return self.net(x.to(device=w.device, dtype=w.dtype))
+
+
+class SceneContextHead(nn.Module):
+    """Scene tokens -> pseudo context latent [1, out_ch, t_ctx, h, w] in the
+    video VAE's latent space, consumed via the native world_latent pathway.
+    Architecture mirrors h3-3d-adapter/scripts/scene_context_head.py exactly
+    (state-dict compatible); Fourier-encoded query positions = size-agnostic."""
+
+    def __init__(self, in_ch, dim=512, out_ch=24, n_layers=2, n_heads=8, n_freqs=6, device=None):
+        super().__init__()
+        self.n_freqs = n_freqs
+        kw = {"dtype": torch.float32, "device": device}
+        self.tok_in = nn.Linear(in_ch, dim, **kw)
+        self.q_in = nn.Sequential(nn.Linear(3 * 2 * n_freqs, dim, **kw), nn.GELU(), nn.Linear(dim, dim, **kw))
+        self.attn = nn.ModuleList()
+        self.ffn = nn.ModuleList()
+        self.ln_q = nn.ModuleList()
+        self.ln_f = nn.ModuleList()
+        for _ in range(n_layers):
+            self.attn.append(nn.MultiheadAttention(dim, n_heads, batch_first=True, **kw))
+            self.ffn.append(nn.Sequential(nn.Linear(dim, dim * 4, **kw), nn.GELU(), nn.Linear(dim * 4, dim, **kw)))
+            self.ln_q.append(nn.LayerNorm(dim, **kw))
+            self.ln_f.append(nn.LayerNorm(dim, **kw))
+        self.out = nn.Linear(dim, out_ch, **kw)
+
+    def _queries(self, t_ctx, h, w, device):
+        t = torch.linspace(-1, 1, t_ctx, device=device) if t_ctx > 1 else torch.zeros(1, device=device)
+        y = torch.linspace(-1, 1, h, device=device)
+        x = torch.linspace(-1, 1, w, device=device)
+        grid = torch.stack(torch.meshgrid(t, y, x, indexing="ij"), dim=-1).reshape(-1, 3)
+        freqs = (2.0 ** torch.arange(self.n_freqs, device=device, dtype=torch.float32)) * math.pi
+        enc = grid[:, :, None] * freqs
+        enc = torch.cat([enc.sin(), enc.cos()], dim=-1).reshape(grid.shape[0], -1)
+        return self.q_in(enc)
+
+    def forward(self, tokens, t_ctx, h, w):
+        w0 = self.tok_in.weight
+        kv = self.tok_in(tokens.to(device=w0.device, dtype=w0.dtype)).unsqueeze(0)
+        q = self._queries(t_ctx, h, w, w0.device).unsqueeze(0)
+        for attn, ffn, ln_q, ln_f in zip(self.attn, self.ffn, self.ln_q, self.ln_f):
+            a, _ = attn(ln_q(q), kv, kv, need_weights=False)
+            q = q + a
+            q = q + ffn(ln_f(q))
+        out = self.out(q)[0]
+        return out.reshape(t_ctx, h, w, -1).permute(3, 0, 1, 2).unsqueeze(0).contiguous()
+
+
 class MiniMaxH3Model(nn.Module):
     def __init__(self, hidden_size=5376, num_layers=50, token_refiner_num_layers=2,
                  num_attention_heads=56, attention_head_dim=128, ffn_hidden_size=14336,
@@ -642,7 +704,8 @@ class MiniMaxH3Model(nn.Module):
                  timestep_input_dim=256, time_embed_hidden_size=5376, time_embed_dim=2688,
                  rope_inv_freq_len=16, norm_eps=1e-5, qk_norm_eps=1e-5, final_norm_eps=1e-5,
                  sigma_shift_video=12.0, sigma_shift_audio=3.0,
-                 adaln_curve_grid=None,
+                 adaln_curve_grid=None, adaln_modalities=3,
+                 scene3d_in_ch=None, scene3d_ctx_head=False,
                  image_model=None, dtype=None, device=None, operations=None, **kwargs):
         super().__init__()
         self.dtype = dtype
@@ -673,10 +736,23 @@ class MiniMaxH3Model(nn.Module):
                                           final_norm_eps, dtype=dtype, device=device, operations=operations)
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size,
-                     time_embed_dim, norm_eps, qk_norm_eps, **curve, dtype=dtype, device=device, operations=operations)
+                     time_embed_dim, norm_eps, qk_norm_eps, adaln_modalities=adaln_modalities,
+                     **curve, dtype=dtype, device=device, operations=operations)
             for _ in range(num_layers)])
         self.final_layer = FinalLayer(hidden_size, time_embed_dim, video_patch_dim, audio_latents_dim,
                                       final_norm_eps, **curve, dtype=dtype, device=device, operations=operations)
+
+        # 4th-modality surgery support: modality count comes from the checkpoint's
+        # adaln table width; the scene input pathway becomes NATIVE submodules when
+        # the surgical checkpoint carries their keys (scene3d_proj.*, scene3d_ctx_head.*).
+        # Base 3-modality checkpoints: scene3d rows fall back to the video tag and the
+        # projector may still be attached externally by a training harness.
+        self.adaln_modalities = adaln_modalities
+        if scene3d_in_ch is not None:
+            self.scene3d_proj = SceneTokenProj(scene3d_in_ch, hidden_size, device=device)
+        if scene3d_ctx_head:
+            self.scene3d_ctx_head = SceneContextHead(scene3d_in_ch if scene3d_in_ch is not None else 8,
+                                                     out_ch=latents_dim, device=device)
 
     def preprocess_text_embeds(self, text_states):
         """[B, L, text_dim] Qwen states -> [B, L, hidden] refined text embeds."""
@@ -771,16 +847,19 @@ class MiniMaxH3Model(nn.Module):
         seg_eff_t = [_eff_t(kind, aug) for _, _, kind, aug in layout.segments]
         unique_t = sorted(set(seg_eff_t))
         t_row = {t: i for i, t in enumerate(unique_t)}
-        # scene3d reuses the video modality tag (the checkpoint has exactly 3 learned
-        # tags; a genuine 4th would need table surgery -- reuse-of-video IS the
-        # warm-start, with the scene3d input projection carrying the distinction)
+        # scene3d tag: on a base 3-modality checkpoint it reuses the video tag
+        # (reuse-of-video IS the warm-start, projection carries the distinction);
+        # on a 4-modality SURGICAL checkpoint it gets the genuine 4th tag, whose
+        # adaln block starts as an exact copy of the video block (bit-identical
+        # step 0) and then trains into a real scene modality.
+        n_mod = self.adaln_modalities
         seg_tag = {"text": 1, "video": 0, "audio": 2, "cond": 0, "ref_img": 0, "ref_audio": 2,
-                   "scene3d": 0}
+                   "scene3d": 3 if n_mod >= 4 else 0}
 
         text_tags = payload.get("text_token_tags")
         mod_segments = []
         for (a, b, kind, aug), eff_t in zip(layout.segments, seg_eff_t):
-            row_base = t_row[eff_t] * 3
+            row_base = t_row[eff_t] * n_mod
             if kind == "text" and text_tags is not None:
                 # the presentation text span mixes tags (vision pads carry the video modality) split into tag runs
                 tags = text_tags.view(-1).tolist()

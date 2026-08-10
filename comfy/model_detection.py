@@ -372,6 +372,15 @@ def detect_unet_config(state_dict, key_prefix, metadata=None):
         dit_config["num_attention_heads"] = qkv.shape[0] // (3 * dit_config["attention_head_dim"])
         dit_config["ffn_hidden_size"] = state_dict['{}blocks.0.mlp.fc1.weight'.format(key_prefix)].shape[0] // 2
         dit_config["text_dim"] = state_dict['{}condition_proj.weight'.format(key_prefix)].shape[1]
+        # scene-modality surgery (4th adaLN tag + native scene input pathway):
+        # modality count read from the adaln table width, scene modules from key presence
+        adaln0 = state_dict['{}blocks.0.adaln_proj.linear.weight'.format(key_prefix)]
+        dit_config["adaln_modalities"] = adaln0.shape[0] // (6 * dit_config["hidden_size"])
+        scene_proj_key = '{}scene3d_proj.net.0.weight'.format(key_prefix)
+        if scene_proj_key in state_dict_keys:
+            dit_config["scene3d_in_ch"] = state_dict[scene_proj_key].shape[1]
+        if '{}scene3d_ctx_head.tok_in.weight'.format(key_prefix) in state_dict_keys:
+            dit_config["scene3d_ctx_head"] = True
         table_key = '{}adaln_t_table'.format(key_prefix)
         if table_key in state_dict_keys:
             # adaln shipped over a precomputed curve basis: the adaln linears span a small shared basis of the time-embedding curve (no time embedder)
