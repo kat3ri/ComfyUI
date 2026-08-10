@@ -135,6 +135,8 @@ def _refs_cursor_delta(refs):
         kind = blk["kind"]
         if kind == "image":
             delta += blk.get("spacing", 1.0)
+        elif kind == "scene3d":
+            delta += blk.get("spacing", 1.0)
         elif kind == "audio":
             delta += float(blk["ref_audio_t"])
         elif kind in ("video", "video_audio"):
@@ -500,6 +502,25 @@ class PackedLayout:
                     # RoPE-distance separation from target_origin; larger reads to the
                     # model as more "distant reference" vs "recent/competing" content
                     cursor += blk.get("spacing", 1.0)
+                elif kind == "scene3d":
+                    # native 3D scene tokens (e.g. a sparse-voxel VAE latent of the
+                    # whole room): one unordered bag, every row at the same RoPE
+                    # position (t = cursor, h/w at the target grid's center) -- RoPE
+                    # "variant A": spatial structure is carried by token content,
+                    # not position. Rows are never denoised and are deliberately
+                    # NOT in img_pos: their embeddings come from the scene3d path
+                    # in _forward (external projector), not cond_video_items.
+                    # Sitting inside the refs row range means ref_decay/ref_ramp
+                    # apply to them like any other reference.
+                    n = int(blk["num_tokens"])
+                    g = torch.empty(n, 3, dtype=torch.float64)
+                    g[:, 0] = cursor
+                    g[:, 1] = float(frame[:, 0].mean())
+                    g[:, 2] = float(frame[:, 1].mean())
+                    segments.append(("scene3d", n, blk.get("aug")))
+                    pos.append(g)
+                    row += n
+                    cursor += blk.get("spacing", 1.0)
                 elif kind == "audio":
                     rt = blk["ref_audio_t"]
                     if rt > 0:
@@ -709,7 +730,7 @@ class MiniMaxH3Model(nn.Module):
         # falls back to the kind's builtin default), so its effective timestep is per
         # segment instance, not shared across the whole kind.
         def _eff_t(kind, aug):
-            if kind in ("cond", "ref_img"):
+            if kind in ("cond", "ref_img", "scene3d"):
                 return max(t_v, float(aug) if aug is not None else VISUAL_COND_TIMESTEP)
             if kind == "ref_audio":
                 return max(t_a, float(aug) if aug is not None else AUDIO_COND_TIMESTEP)
@@ -718,7 +739,11 @@ class MiniMaxH3Model(nn.Module):
         seg_eff_t = [_eff_t(kind, aug) for _, _, kind, aug in layout.segments]
         unique_t = sorted(set(seg_eff_t))
         t_row = {t: i for i, t in enumerate(unique_t)}
-        seg_tag = {"text": 1, "video": 0, "audio": 2, "cond": 0, "ref_img": 0, "ref_audio": 2}
+        # scene3d reuses the video modality tag (the checkpoint has exactly 3 learned
+        # tags; a genuine 4th would need table surgery -- reuse-of-video IS the
+        # warm-start, with the scene3d input projection carrying the distinction)
+        seg_tag = {"text": 1, "video": 0, "audio": 2, "cond": 0, "ref_img": 0, "ref_audio": 2,
+                   "scene3d": 0}
 
         text_tags = payload.get("text_token_tags")
         mod_segments = []
@@ -761,9 +786,21 @@ class MiniMaxH3Model(nn.Module):
             text_states = self.token_refiner(self.condition_proj(text_states),
                                              transformer_options=transformer_options)
 
+        # native 3D scene tokens: projected by an externally-attached adapter
+        # (training harness attaches self.scene3d_proj; base checkpoints don't
+        # carry it, and absent scene3d items this whole path is dormant)
+        scene3d_embed = None
+        scene3d_items = payload.get("scene3d_items")
+        if scene3d_items:
+            proj = getattr(self, "scene3d_proj", None)
+            if proj is None:
+                raise RuntimeError("scene3d conditioning present but no scene3d_proj adapter is attached to the model")
+            scene3d_embed = torch.cat(
+                [proj(t.to(device=device, dtype=torch.float32)) for t in scene3d_items], dim=0).to(dtype)
+
         # segments are contiguous: assemble by slices, embed rows follow segment order
         h = torch.empty(layout.seq_len, self.hidden_size, dtype=dtype, device=device)
-        voff = aoff = 0
+        voff = aoff = soff = 0
         for a, b, kind, _aug in layout.segments:
             n = b - a
             if kind == "text":
@@ -771,6 +808,9 @@ class MiniMaxH3Model(nn.Module):
             elif kind in ("cond", "ref_img", "video"):
                 h[a:b] = video_embed[voff:voff + n]
                 voff += n
+            elif kind == "scene3d":
+                h[a:b] = scene3d_embed[soff:soff + n]
+                soff += n
             else:  # ref_audio / audio
                 h[a:b] = audio_embed[aoff:aoff + n]
                 aoff += n

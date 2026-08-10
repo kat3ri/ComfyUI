@@ -2103,8 +2103,13 @@ class MiniMaxH3(BaseModel):
         if refs is not None:
             payload["refs"] = refs
             # keyframes' cond rows (if any) come first in the packed layout; append refs after them
+            # (scene3d blocks carry "tokens", not "latent"/"audio_latent", so the two
+            # collections below skip them by construction)
             payload["cond_video_items"] = payload.get("cond_video_items", []) + [(r["latent"], r.get("aug")) for r in refs if "latent" in r]
             payload["cond_audio_items"] = payload.get("cond_audio_items", []) + [(r["audio_latent"], r.get("aug")) for r in refs if r.get("audio_latent") is not None]
+            scene3d = [r["tokens"] for r in refs if r.get("kind") == "scene3d"]
+            if scene3d:
+                payload["scene3d_items"] = scene3d
         if kwargs.get("minimax_ref_decay", None) is not None:
             payload["ref_decay"] = kwargs["minimax_ref_decay"]
         if kwargs.get("minimax_ref_ramp", None) is not None:
