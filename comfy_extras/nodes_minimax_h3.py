@@ -914,6 +914,58 @@ class MiniMaxH3RenderPLYCutoutViews(io.ComfyNode):
         return io.NodeOutput(images)
 
 
+class MiniMaxH3LatentUpsample(io.ComfyNode):
+    """2x spatial upscale of an H3 video latent via a trained latent upscaler.
+
+    H3 latents are already normalized inside the VAE, so unlike the LTX
+    equivalent there is no per-channel-statistics round-trip and no VAE input.
+    The audio stream of an AV NestedTensor passes through untouched. Follow
+    with a low-denoise sampling pass at the new canvas to restore detail.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3LatentUpsample",
+            display_name="MiniMax H3 Latent Upscale",
+            category="model/latent/minimax",
+            is_experimental=True,
+            description="2x spatial upscale of an H3 video latent (audio passes through). Checkpoint from h3-latent-upscaler via Load Latent Upscale Model.",
+            inputs=[
+                io.Latent.Input("samples"),
+                io.LatentUpscaleModel.Input("upscale_model"),
+            ],
+            outputs=[io.Latent.Output()],
+        )
+
+    @classmethod
+    def execute(cls, samples, upscale_model) -> io.NodeOutput:
+        device = upscale_model.load_device
+        model = upscale_model.model
+        model_dtype = upscale_model.model_dtype()
+        latents = samples["samples"]
+        audio = None
+        if latents.is_nested:
+            video, audio = latents.tensors
+        else:
+            video = latents
+        input_dtype = video.dtype
+
+        memory_required = math.prod(video.shape) * 3000.0
+        comfy.model_management.load_models_gpu([upscale_model], memory_required=memory_required)
+
+        upscaled = model(video.to(dtype=model_dtype, device=device))
+        upscaled = upscaled.to(dtype=input_dtype, device=comfy.model_management.intermediate_device())
+
+        out = samples.copy()
+        if audio is not None:
+            out["samples"] = comfy.nested_tensor.NestedTensor((upscaled, audio))
+        else:
+            out["samples"] = upscaled
+        out.pop("noise_mask", None)
+        return io.NodeOutput(out)
+
+
 class MiniMaxH3SigmaShift(io.ComfyNode):
     """Set the video/audio flow shifts coherently.
 
@@ -1145,6 +1197,7 @@ class MiniMaxH3Extension(ComfyExtension):
             MiniMaxH3RenderPLYWalkthrough,
             MiniMaxH3RenderPLYCutoutViews,
             MiniMaxH3SigmaShift,
+            MiniMaxH3LatentUpsample,
             MiniMaxH3SceneAdapterLoader,
             MiniMaxH3SceneLatent,
             MiniMaxH3SceneToContextLatent
