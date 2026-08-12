@@ -950,6 +950,16 @@ class MiniMaxH3LatentUpsample(io.ComfyNode):
         else:
             video = latents
         input_dtype = video.dtype
+        logging.info(
+            f"MiniMaxH3LatentUpsample: input nested={latents.is_nested} "
+            f"video={tuple(video.shape)} audio={tuple(audio.shape) if audio is not None else None}"
+        )
+        if video.ndim != 5 or video.shape[1] != 24:
+            raise ValueError(
+                f"MiniMaxH3LatentUpsample expects a video latent [B,24,T,H,W], got {tuple(video.shape)} "
+                f"(nested={latents.is_nested}). Something upstream flattened or reordered the AV latent -- "
+                f"use MiniMaxH3SplitAV to inspect."
+            )
 
         memory_required = math.prod(video.shape) * 3000.0
         comfy.model_management.load_models_gpu([upscale_model], memory_required=memory_required)
@@ -964,6 +974,65 @@ class MiniMaxH3LatentUpsample(io.ComfyNode):
             out["samples"] = upscaled
         out.pop("noise_mask", None)
         return io.NodeOutput(out)
+
+
+class MiniMaxH3SplitAV(io.ComfyNode):
+    """Split an H3 AV NestedTensor latent into separate video and audio latents.
+
+    Diagnostic + plumbing: lets you route the video stream alone (e.g. into a
+    latent upscaler or inspection nodes) and rejoin with MiniMaxH3JoinAV.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3SplitAV",
+            display_name="MiniMax H3 Split AV Latent",
+            category="model/latent/minimax",
+            inputs=[io.Latent.Input("samples")],
+            outputs=[
+                io.Latent.Output(display_name="video"),
+                io.Latent.Output(display_name="audio"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, samples) -> io.NodeOutput:
+        latents = samples["samples"]
+        if latents.is_nested:
+            video, audio = latents.tensors
+        else:
+            video, audio = latents, None
+        logging.info(
+            f"MiniMaxH3SplitAV: nested={latents.is_nested} video={tuple(video.shape)} "
+            f"audio={tuple(audio.shape) if audio is not None else None}"
+        )
+        audio_out = {"samples": audio} if audio is not None else {"samples": torch.zeros(1, 32, 2, 1)}
+        return io.NodeOutput({"samples": video}, audio_out)
+
+
+class MiniMaxH3JoinAV(io.ComfyNode):
+    """Rejoin video and audio latents into an H3 AV NestedTensor latent."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3JoinAV",
+            display_name="MiniMax H3 Join AV Latent",
+            category="model/latent/minimax",
+            inputs=[
+                io.Latent.Input("video"),
+                io.Latent.Input("audio", optional=True),
+            ],
+            outputs=[io.Latent.Output()],
+        )
+
+    @classmethod
+    def execute(cls, video, audio=None) -> io.NodeOutput:
+        v = video["samples"]
+        if audio is None:
+            return io.NodeOutput({"samples": v})
+        return io.NodeOutput({"samples": comfy.nested_tensor.NestedTensor((v, audio["samples"]))})
 
 
 class MiniMaxH3SigmaShift(io.ComfyNode):
@@ -1198,6 +1267,8 @@ class MiniMaxH3Extension(ComfyExtension):
             MiniMaxH3RenderPLYCutoutViews,
             MiniMaxH3SigmaShift,
             MiniMaxH3LatentUpsample,
+            MiniMaxH3SplitAV,
+            MiniMaxH3JoinAV,
             MiniMaxH3SceneAdapterLoader,
             MiniMaxH3SceneLatent,
             MiniMaxH3SceneToContextLatent
