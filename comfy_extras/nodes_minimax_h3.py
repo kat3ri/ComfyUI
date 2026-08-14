@@ -20,6 +20,7 @@ import comfy.model_management
 import comfy.model_sampling
 import comfy.nested_tensor
 import comfy.utils
+import comfy.weight_adapter
 import node_helpers
 from comfy.ldm.minimax.model import context_span
 from comfy_api.latest import ComfyExtension, io
@@ -1098,19 +1099,18 @@ class MiniMaxH3SceneAdapterLoader(io.ComfyNode):
     trained by h3-3d-adapter/scripts/train_scene3d_*.py) onto the H3 DiT so
     MiniMaxH3SceneLatent conditioning has a pathway into the model.
 
-    Research-grade: mutates the loaded diffusion model in place (LoRA is a
-    forward-wrap, not a ComfyUI weight patch), so it affects every workflow
-    sharing that loaded UNet until strength is set to 0 or the UNet is
-    reloaded. Re-executing with a different checkpoint/strength updates the
-    attached adapter rather than stacking."""
+    Applied through ModelPatcher: the projector is an object patch and the LoRA
+    is a standard ComfyUI weight patch, so the adapter rides on the returned
+    MODEL only. Bypassing the node, or running another workflow off the same
+    loaded UNet, is unaffected -- no reload needed, and it stacks with LoRAs."""
 
     @classmethod
     def define_schema(cls):
         return io.Schema(
             node_id="MiniMaxH3SceneAdapterLoader",
-            display_name="MiniMax H3 Scene Adapter Loader (experimental)",
+            display_name="MiniMax H3 Scene Adapter Loader",
             category="model/patch/minimax",
-            description="Load a trained scene3d adapter checkpoint (proj + LoRA) onto the H3 model. In-place research patch: reload the UNet to fully remove.",
+            description="Load a trained scene3d adapter checkpoint (proj + LoRA) onto the H3 model, via ModelPatcher (scoped to the returned MODEL).",
             inputs=[
                 io.Model.Input("model"),
                 io.String.Input("adapter_path", tooltip="Path to a scene3d adapter .pt ({proj, lora, rank, in_ch}), e.g. /weka/home-kateriw/h3-3d-adapter/checkpoints/scene3d_adapter_v2.pt"),
@@ -1122,45 +1122,45 @@ class MiniMaxH3SceneAdapterLoader(io.ComfyNode):
     @classmethod
     def execute(cls, model, adapter_path, strength=1.0) -> io.NodeOutput:
         ck = torch.load(adapter_path, map_location="cpu")
-        dm = model.model.diffusion_model
+        m = model.clone()
+        dm = m.model.diffusion_model
 
         proj = _SceneTokenProj(ck["in_ch"], dm.hidden_size)
         proj.load_state_dict(ck["proj"])
         proj.float()
-        dm.scene3d_proj = proj
+        # object patch, not setattr: applied on patch_model and removed on unpatch,
+        # so bypassing this node really does remove the adapter
+        m.add_object_patch("diffusion_model.scene3d_proj", proj)
 
+        # The LoRA is a plain low-rank delta on two linears per block, which is
+        # exactly ComfyUI's own "lora" patch -- as a weight patch it composes with
+        # other LoRAs, reverts on unpatch, and needs no forward rebinding.
+        # Checkpoint order is flat per block: A_qkv, B_qkv, A_out, B_out.
         rank = ck["rank"]
-        base_scale = 16.0 / rank  # alpha=16, matches training
-        if not hasattr(dm, "_scene3d_lora"):
-            state = {"scale": base_scale * strength}
-            params = []
-            for block in dm.blocks:
-                for lin in (block.attn.qkv_proj, block.attn.out_proj):
-                    A = torch.nn.Parameter(torch.zeros(rank, lin.in_features), requires_grad=False)
-                    B = torch.nn.Parameter(torch.zeros(lin.out_features, rank), requires_grad=False)
-                    orig = lin.forward
+        lora = ck["lora"]
+        targets = [(i, name) for i in range(len(dm.blocks)) for name in ("qkv_proj", "out_proj")]
+        if len(lora) != 2 * len(targets):
+            raise RuntimeError(
+                "adapter shape mismatch: checkpoint has {} LoRA tensors, this model needs {} "
+                "({} blocks x 2 linears x A/B)".format(len(lora), 2 * len(targets), len(dm.blocks)))
 
-                    def fwd(x, _orig=orig, _A=A, _B=B, _state=state):
-                        y = _orig(x)
-                        if _state["scale"] == 0.0:
-                            return y
-                        if _A.device != x.device:
-                            _A.data = _A.data.to(x.device)
-                            _B.data = _B.data.to(x.device)
-                        return y + ((x.float() @ _A.t()) @ _B.t() * _state["scale"]).to(y.dtype)
+        patches = {}
+        for idx, (block_i, name) in enumerate(targets):
+            A, B = lora[2 * idx].float(), lora[2 * idx + 1].float()   # [rank, in], [out, rank]
+            key = "diffusion_model.blocks.{}.attn.{}.weight".format(block_i, name)
+            # (mat1=up, mat2=down, alpha, mid, dora_scale, reshape); comfy scales by
+            # alpha/mat2.shape[0] = 16/rank, matching the adapter's training alpha
+            patches[key] = comfy.weight_adapter.LoRAAdapter(set(), (B, A, 16.0, None, None, None))
 
-                    lin.forward = fwd
-                    params += [A, B]
-            dm._scene3d_lora = params
-            dm._scene3d_lora_state = state
-        if len(dm._scene3d_lora) != len(ck["lora"]):
-            raise RuntimeError(f"adapter rank mismatch: model has {len(dm._scene3d_lora)} LoRA tensors attached, checkpoint has {len(ck['lora'])}; reload the UNet before switching ranks")
-        with torch.no_grad():
-            for p, saved in zip(dm._scene3d_lora, ck["lora"]):
-                p.data = saved.float().to(p.device)
-        dm._scene3d_lora_state["scale"] = base_scale * strength
-        logging.info(f"MiniMaxH3SceneAdapterLoader: attached {adapter_path} (rank {rank}, strength {strength}, step {ck.get('step', '?')})")
-        return io.NodeOutput(model)
+        missing = [k for k in patches if k not in m.model.state_dict()]
+        if missing:
+            raise RuntimeError("adapter targets {} weights this model does not have, e.g. {}"
+                               .format(len(missing), missing[0]))
+
+        m.add_patches(patches, strength)
+        logging.info("MiniMaxH3SceneAdapterLoader: %s (rank %s, strength %s, step %s) -> %d patched weights",
+                     adapter_path, rank, strength, ck.get("step", "?"), len(patches))
+        return io.NodeOutput(m)
 
 
 class MiniMaxH3SceneLatent(io.ComfyNode):
