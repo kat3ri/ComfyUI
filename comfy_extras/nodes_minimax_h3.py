@@ -11,10 +11,14 @@ audio stream's shifted schedule internally).
 
 import logging
 import math
+import os
+import time
 
+import safetensors.torch
 import torch
 import torchaudio
 
+import folder_paths
 import nodes
 import comfy.model_management
 import comfy.model_sampling
@@ -1035,6 +1039,171 @@ class MiniMaxH3JoinAV(io.ComfyNode):
         return io.NodeOutput({"samples": comfy.nested_tensor.NestedTensor((v, audio["samples"]))})
 
 
+# --- loading saved latents back in -------------------------------------------
+# Core's LoadLatent lists input/ only (top level, non-recursive) while SaveLatent
+# writes to output/latents/, so a saved latent can never appear in its dropdown,
+# and naming one fails VALIDATE_INPUTS because an un-annotated name resolves
+# against input/. These read from wherever the file actually is.
+
+_LATENT_KEYS = ("samples", "latent_tensor", "lr_latent", "hr_latent", "latent", "video")
+_SD_SCALE = 1.0 / 0.18215
+_SCAN_CACHE = {"at": 0.0, "files": []}
+_SCAN_TTL = 15.0        # define_schema runs on every /object_info; don't re-walk output/
+_SCAN_DEPTH = 4         # latents live near the top; the rest of output/ can be huge
+
+
+def _scan_latents(limit=400):
+    """Latent files under output/ and input/, newest first, deduped by real path.
+
+    `.latent` anywhere; `.safetensors` only inside a directory whose name mentions
+    "latent", so exported LoRAs don't flood the dropdown.
+    """
+    now = time.time()
+    if now - _SCAN_CACHE["at"] < _SCAN_TTL:
+        return list(_SCAN_CACHE["files"])
+
+    base = folder_paths.base_path
+    found, seen = [], set()
+    for root in (folder_paths.get_output_directory(), folder_paths.get_input_directory()):
+        if not os.path.isdir(root):
+            continue
+        root_depth = root.rstrip(os.sep).count(os.sep)
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+            if dirpath.count(os.sep) - root_depth >= _SCAN_DEPTH:
+                dirnames[:] = []
+            else:
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            in_latent_dir = "latent" in os.path.relpath(dirpath, root).lower()
+            for fn in filenames:
+                if not (fn.endswith(".latent") or (in_latent_dir and fn.endswith(".safetensors"))):
+                    continue
+                full = os.path.join(dirpath, fn)
+                try:
+                    real = os.path.realpath(full)
+                    if real in seen:
+                        continue
+                    mtime = os.path.getmtime(full)
+                except OSError:      # broken symlink, or vanished mid-walk
+                    continue
+                seen.add(real)
+                found.append((mtime, os.path.relpath(full, base)))
+    found.sort(reverse=True)
+    files = [name for _, name in found[:limit]]
+    _SCAN_CACHE.update(at=now, files=files)
+    return list(files)
+
+
+def _resolve_latent_path(latent, path=""):
+    """Absolute path for the chosen file, or None. `path` wins when set."""
+    path = (path or "").strip()
+    roots = [folder_paths.base_path, folder_paths.get_output_directory(),
+             folder_paths.get_input_directory()]
+    if path:
+        cand = os.path.expanduser(path)
+        for root in [""] + roots:
+            full = cand if os.path.isabs(cand) else os.path.join(root, cand)
+            if os.path.isfile(full):
+                return full
+        return None
+    if not latent:
+        return None
+    for root in roots:
+        full = os.path.join(root, latent)
+        if os.path.isfile(full):
+            return full
+    return None
+
+
+def _extract_latent(sd, key=""):
+    """Pull the video tensor out of a loaded state dict as [B, C, T, H, W]."""
+    key = (key or "").strip()
+    if key:
+        if key not in sd:
+            raise ValueError("key '{}' not in file (has: {})".format(key, ", ".join(sd.keys())))
+        name = key
+    else:
+        name = next((k for k in _LATENT_KEYS if k in sd), None)
+        if name is None:
+            tensors = [k for k, v in sd.items() if v.numel() > 0]
+            if len(tensors) != 1:
+                raise ValueError("no known latent key; found {}. Set 'key' to pick one."
+                                 .format(", ".join(sd.keys()) or "nothing"))
+            name = tensors[0]
+
+    t = sd[name].float()
+    if t.ndim == 4:                  # [C, T, H, W] -> add batch
+        t = t.unsqueeze(0)
+    if t.ndim != 5:
+        raise ValueError("'{}' has shape {}; expected 5 dims [B,C,T,H,W]"
+                         .format(name, tuple(t.shape)))
+
+    # Core SaveLatent's legacy format is SD-scaled; its v0 marker means "not scaled".
+    # Files written with a 'samples' key are never scaled.
+    if name == "latent_tensor" and "latent_format_version_0" not in sd:
+        t = t * _SD_SCALE
+
+    if t.shape[1] != 24:
+        logging.warning("MiniMaxH3LoadVideoLatent: %d channels, H3 latents have 24", t.shape[1])
+    return t, name
+
+
+class MiniMaxH3LoadVideoLatent(io.ComfyNode):
+    """Load a saved H3 video latent from output/, input/, or any path."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3LoadVideoLatent",
+            display_name="MiniMax H3 Load Video Latent",
+            category="model/latent/minimax",
+            description="Load a saved H3 video latent by browsing output/ and input/, or by "
+                        "pasting a path. Returns the video stream -- add Join AV Latent for a "
+                        "sampler-ready AV latent.",
+            inputs=[
+                io.Combo.Input("latent", options=_scan_latents(),
+                               tooltip="Latent files under output/ and input/, newest first. "
+                                       "Ignored when 'path' is set."),
+                io.String.Input("path", default="", optional=True,
+                                tooltip="Absolute path, or one relative to the ComfyUI root / "
+                                        "output / input. Overrides the dropdown, so you can "
+                                        "paste a path instead of browsing."),
+                io.String.Input("key", default="", optional=True,
+                                tooltip="Tensor key to read. Blank auto-detects (samples, "
+                                        "latent_tensor, lr_latent, hr_latent, ...). Use it to "
+                                        "pick a side of a training pair."),
+            ],
+            outputs=[io.Latent.Output(display_name="video")],
+        )
+
+    @classmethod
+    def execute(cls, latent, path="", key="") -> io.NodeOutput:
+        full = _resolve_latent_path(latent, path)
+        if full is None:
+            raise FileNotFoundError("latent not found: {!r}".format((path or "").strip() or latent))
+        sd = safetensors.torch.load_file(full, device="cpu")
+        samples, name = _extract_latent(sd, key)
+        logging.info("MiniMaxH3LoadVideoLatent: %s key='%s' shape=%s",
+                     os.path.basename(full), name, tuple(samples.shape))
+        return io.NodeOutput({"samples": samples})
+
+    @classmethod
+    def fingerprint_inputs(cls, latent, path="", key=""):
+        full = _resolve_latent_path(latent, path)
+        if full is None:
+            return float("nan")      # unresolvable: never cache
+        st = os.stat(full)
+        return "{}:{}:{}:{}".format(full, st.st_mtime_ns, st.st_size, key)
+
+    @classmethod
+    def validate_inputs(cls, latent, path="", key=""):
+        # Naming 'latent' here also skips the built-in combo-membership check, so a
+        # pasted path still validates when the dropdown is empty or stale.
+        if _resolve_latent_path(latent, path) is None:
+            return "Latent file not found: {}".format(
+                (path or "").strip() or latent or "(nothing selected)")
+        return True
+
+
 class MiniMaxH3SigmaShift(io.ComfyNode):
     """Set the video/audio flow shifts coherently.
 
@@ -1269,6 +1438,7 @@ class MiniMaxH3Extension(ComfyExtension):
             MiniMaxH3LatentUpsample,
             MiniMaxH3SplitAV,
             MiniMaxH3JoinAV,
+            MiniMaxH3LoadVideoLatent,
             MiniMaxH3SceneAdapterLoader,
             MiniMaxH3SceneLatent,
             MiniMaxH3SceneToContextLatent
