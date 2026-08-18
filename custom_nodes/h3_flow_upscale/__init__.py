@@ -113,9 +113,67 @@ class MiniMaxH3FlowUpscale(io.ComfyNode):
         return io.NodeOutput(res)
 
 
+class QwenFlowUpscale(io.ComfyNode):
+    """Same FlowUpsampler family, ported to Qwen-Image's 16-channel VAE latent
+    space (see /weka/home-kateriw/h3-latent-upscaler/QWEN_LATENT_UPSCALER_HANDOFF.md).
+    Qwen latents are still images (T=1, no audio track), so this skips the
+    nested-tensor/audio handling MiniMaxH3FlowUpscale needs for video, and
+    accepts either [B,C,H,W] or [B,C,T,H,W] -- Comfy's Qwen-Image latent is
+    [B,C,T,H,W] with T=1 already present; a T axis is only added if missing.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="QwenFlowUpscale",
+            display_name="Qwen Flow Latent Upscale (2x)",
+            category="model/latent/qwen",
+            is_experimental=True,
+            description="Generative 2x latent upscale for Qwen-Image (flow matching). "
+                        "Try 4-8 steps first: more steps is not always sharper.",
+            inputs=[
+                io.Latent.Input("samples"),
+                io.Combo.Input("model_name",
+                               options=folder_paths.get_filename_list("h3_flow_upscalers")),
+                io.Int.Input("steps", default=6, min=1, max=64),
+                io.Int.Input("seed", default=0, min=0, max=0xFFFFFFFFFFFFFFF,
+                             control_after_generate=True),
+            ],
+            outputs=[io.Latent.Output()],
+        )
+
+    @classmethod
+    def execute(cls, samples, model_name, steps=6, seed=0) -> io.NodeOutput:
+        from model_flow import sample
+
+        device = comfy.model_management.get_torch_device()
+        model, cfg = _load(model_name)
+
+        lr = samples["samples"]
+        expected_c = cfg["latent_channels"]
+        if lr.shape[1] != expected_c:
+            raise ValueError(f"expected a {expected_c}-channel latent for {model_name}, "
+                              f"got {tuple(lr.shape)}")
+        added_t = lr.ndim == 4
+        lr5 = lr.unsqueeze(2) if added_t else lr
+
+        in_dtype = lr.dtype
+        lr5 = lr5.float().to(device)
+        gen = torch.Generator(device=device).manual_seed(int(seed))
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            out = sample(model, lr5, steps=int(steps), device=device, generator=gen)
+        out = out.squeeze(2) if added_t else out
+        out = out.to(dtype=in_dtype, device=comfy.model_management.intermediate_device())
+
+        res = samples.copy()
+        res["samples"] = out
+        res.pop("noise_mask", None)
+        return io.NodeOutput(res)
+
+
 class Extension(ComfyExtension):
     async def get_node_list(self):
-        return [MiniMaxH3FlowUpscale]
+        return [MiniMaxH3FlowUpscale, QwenFlowUpscale]
 
 
 async def comfy_entrypoint() -> Extension:
